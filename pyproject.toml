@@ -22,6 +22,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# 浏览器登录导入。复用系统已装的 Chrome/Edge，无需 `playwright install`。
+browser = ["playwright>=1.40"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "respx>=0.21"]
 
 [project.scripts]

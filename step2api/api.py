@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field, field_validator
 from .config import CN_HOST_MARKERS, PORTAL_URL, Settings
 from .crypto import key_fingerprint, key_hint
 from .proxy import ProxyError, normalize_proxy, parse_proxy_list, redact_proxy
+from .login import LoginManager, PlaywrightMissing, playwright_available
 from .quota import probe_plan_endpoint
 from .store import Store
 
@@ -329,6 +330,29 @@ class ConsoleCredentials(BaseModel):
     token: str = Field(default="", description="Cookie Oasis-Token")
     webid: str = Field(default="", description="localStorage.web_id")
     verify: bool = True
+
+
+class LoginStart(BaseModel):
+    """开始一次浏览器登录导入。"""
+
+    timeout: float = Field(default=300.0, ge=30, le=900)
+
+
+class LoginCommit(BaseModel):
+    """把登录会话里抓到的 Key 落库。"""
+
+    group_name: str = "default"
+    name_prefix: str = ""
+    weight: int = Field(default=1, ge=1, le=100)
+    priority: int = Field(default=100, ge=0, le=10000)
+    #: 要导入哪些 Key（key_id 列表）；为空则只导入默认 Key
+    key_ids: list[str] = Field(default_factory=list)
+    #: 是否把控制台凭据一并写入账号（用于查真实套餐额度）
+    with_console: bool = True
+    verify: bool = True
+    proxy_mode: ProxyMode = "inherit"
+    pool_id: int | None = None
+    proxy_id: int | None = None
 
 
 class RoutingUpdate(BaseModel):
@@ -743,6 +767,161 @@ async def toggle_account(request: Request, account_id: int) -> dict:
 # --------------------------------------------------------------------------
 # 导入
 # --------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------
+# 浏览器登录导入
+# --------------------------------------------------------------------------
+
+
+def _login_manager(request: Request) -> LoginManager:
+    manager = getattr(request.app.state, "login_manager", None)
+    if manager is None:
+        manager = LoginManager(request.app.state.settings)
+        request.app.state.login_manager = manager
+    return manager
+
+
+@router.get("/login/available", dependencies=guard)
+async def login_available(request: Request) -> dict:
+    """浏览器登录导入是否可用（取决于 playwright 是否安装）。"""
+    settings: Settings = request.app.state.settings
+    has_lib = playwright_available()
+    enabled = settings.browser_login
+    hint = None
+    if not enabled:
+        hint = (
+            "浏览器登录导入默认关闭。它依赖控制台私有接口，上游改版可能失效，"
+            "因此不作为默认路径。设 STEP2API_BROWSER_LOGIN=true 后重启可启用；"
+            "手动粘贴凭据始终可用。"
+        )
+    elif not has_lib:
+        hint = (
+            "未安装 playwright。执行 pip install playwright 后重启即可启用；"
+            "无需 playwright install，本功能复用系统已装的 Chrome/Edge。"
+        )
+    return {
+        "available": bool(enabled and has_lib),
+        "enabled": enabled,
+        "installed": has_lib,
+        "hint": hint,
+        "portal": PORTAL_URL,
+    }
+
+
+@router.post("/login/start", dependencies=guard)
+async def login_start(request: Request, payload: LoginStart) -> dict:
+    """开一个真实浏览器窗口，等用户登录后抓取 Key 与控制台凭据。"""
+    settings: Settings = _settings(request)
+    if not settings.browser_login:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "浏览器登录导入未启用（依赖控制台私有接口，默认关闭）。"
+                "设 STEP2API_BROWSER_LOGIN=true 后重启即可。"
+            ),
+        )
+
+    manager = _login_manager(request)
+    try:
+        session = manager.start(timeout=payload.timeout)
+    except PlaywrightMissing as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"session": session.as_public()}
+
+
+@router.get("/login/{session_id}", dependencies=guard)
+async def login_status(request: Request, session_id: str) -> dict:
+    session = _login_manager(request).get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="登录会话不存在或已过期")
+    return {"session": session.as_public()}
+
+
+@router.delete("/login/{session_id}", dependencies=guard)
+async def login_cancel(request: Request, session_id: str) -> dict:
+    ok = _login_manager(request).cancel(session_id)
+    return {"cancelled": ok}
+
+
+@router.post("/login/{session_id}/commit", dependencies=guard)
+async def login_commit(
+    request: Request, session_id: str, payload: LoginCommit
+) -> dict:
+    """把登录会话抓到的 Key 写入账号库。"""
+    store = _store(request)
+    scheduler = request.app.state.scheduler
+    manager = _login_manager(request)
+
+    session = manager.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="登录会话不存在或已过期")
+    if session.status != "success":
+        raise HTTPException(
+            status_code=409, detail=f"登录会话尚未就绪（当前 {session.status}）"
+        )
+
+    wanted = set(payload.key_ids) if payload.key_ids else None
+    selected = [
+        k for k in session.keys if wanted is None or k.key_id in wanted
+    ] or [k for k in session.keys if k.is_default] or session.keys[:1]
+
+    imported: list[dict] = []
+    for index, key in enumerate(selected, start=1):
+        existing = store.get_account_by_fp(key_fingerprint(key.access_key))
+
+        proxy_id = payload.proxy_id
+        pool_id = payload.pool_id
+        if payload.proxy_mode == "dedicated" and proxy_id is None:
+            proxy_id = None
+        if payload.proxy_mode == "pool" and pool_id is None:
+            pool_id = None
+
+        name = (
+            f"{payload.name_prefix}{index}"
+            if payload.name_prefix
+            else (key.name or key.hint)
+        )
+
+        if existing is not None:
+            account_id = int(existing["id"])
+            store.set_account_key(account_id, key.access_key)
+            action = "updated"
+        else:
+            account_id = store.create_account(
+                name=name,
+                api_key=key.access_key,
+                group_name=payload.group_name,
+                weight=payload.weight,
+                priority=payload.priority,
+                proxy_mode=payload.proxy_mode,
+                pool_id=pool_id,
+                proxy_id=proxy_id,
+            )
+            action = "created"
+
+        if payload.with_console and session.token and session.webid:
+            store.set_console_credentials(account_id, session.token, session.webid)
+
+        item: dict = {
+            "id": account_id,
+            "name": name,
+            "action": action,
+            "key_hint": key.hint,
+            "verified": None,
+        }
+        if payload.verify:
+            item["verified"] = await scheduler.refresh_account(account_id)
+        imported.append(item)
+
+    # 凭据已落库，从内存里抹掉
+    session.token = ""
+    session.webid = ""
+    for key in session.keys:
+        key.access_key = ""
+    manager.forget(session_id)
+
+    return {"imported": imported, "total": len(imported)}
 
 
 @router.post("/import/preview", dependencies=guard)

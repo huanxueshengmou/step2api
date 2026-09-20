@@ -76,7 +76,37 @@ uv run python -m step2api serve
 
 ### 导入账号
 
-控制台「账号 → 导入账号」，粘贴内容即可。支持三种格式：
+两种方式，**推荐第一种**。
+
+#### 方式一：粘贴导入（推荐）
+
+控制台「账号 → 粘贴导入」，粘贴 Key，再在账号编辑里补上控制台凭据
+（用于查套餐额度，见下文「关于额度查询」）。命令行同样可以：
+
+```bash
+step2api import keys.txt --prefix acct- --verify
+```
+
+这是唯一的**长期可靠**路径：只依赖官方公开的 API Key 机制。
+
+#### 方式二：浏览器登录导入（便利功能，默认关闭）
+
+设 `STEP2API_BROWSER_LOGIN=true` 重启后，控制台会多出「浏览器登录导入」按钮：
+打开一个独立浏览器窗口，你正常登录，服务端自动抓取该账号下的 API Key 与
+控制台凭据，省去手动复制。
+
+```bash
+export STEP2API_BROWSER_LOGIN=true
+pip install playwright     # 复用系统已装的 Chrome/Edge，无需 playwright install
+```
+
+> ⚠️ 这个功能依赖控制台**未公开的私有接口**（`/api/step.openapi.devcenter.Dashboard/*`），
+> 官方无文档、无版本承诺，前端改版后随时可能失效。所以它默认关闭，且不应作为
+> 唯一的导入路径。失效时请回退到方式一。
+
+#### 粘贴格式
+
+支持三种格式：
 
 ```
 # 每行一个 Key
@@ -98,12 +128,6 @@ sk-dddddddddddddddddddddddd|socks5://5.6.7.8:1080
 ```
 
 导入时可以选择代理分配方式：不分配、每个 Key 绑定自己的代理、或者全部塞进一个新建的代理池轮转。
-
-命令行同样可以导入：
-
-```bash
-step2api import keys.txt --prefix acct- --verify
-```
 
 ### 接入客户端
 
@@ -384,6 +408,7 @@ X-Step2api-Attempt: 1
 | `STEP2API_CONSOLE_BASE` | `https://account.stepfun.ai` | 控制台额度接口基址 |
 | `STEP2API_CONSOLE_APP_ID` | `20700` | 控制台应用 ID，Step Plan 必须为 20700 |
 | `STEP2API_CONSOLE_SYNC` | `true` | 是否启用控制台额度同步 |
+| `STEP2API_BROWSER_LOGIN` | `false` | 是否启用浏览器登录导入（依赖私有接口，默认关） |
 
 ### 路由
 
@@ -452,6 +477,10 @@ step2api export --out accounts.json   # 导出账号明细（不含 Key 明文�
 | `DELETE` | `/api/accounts/{id}/console` | 清除控制台凭据 |
 | `POST` | `/api/accounts/{id}/reset` | 清除冷却与失败计数 |
 | `POST` | `/api/accounts/{id}/toggle` | 启用 / 禁用 |
+| `GET` | `/api/login/available` | 浏览器登录导入是否可用 |
+| `POST` | `/api/login/start` | 打开登录窗口，开始抓取 |
+| `GET` | `/api/login/{id}` | 轮询登录状态 |
+| `POST` | `/api/login/{id}/commit` | 把抓到的 Key 写入账号库 |
 | `POST` | `/api/import/preview` | 解析预览（不落库） |
 | `POST` | `/api/import` | 批量导入 |
 | `GET` `POST` `PATCH` `DELETE` | `/api/proxies[/{id}]` | 代理增删改查 |

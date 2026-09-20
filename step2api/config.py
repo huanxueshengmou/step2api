@@ -164,6 +164,12 @@ class Settings:
     console_app_id: int = field(default_factory=lambda: _env_int("CONSOLE_APP_ID", CONSOLE_APP_ID))
     #: 是否启用控制台额度同步（需要为账号配置 Oasis 会话凭据）
     console_sync: bool = field(default_factory=lambda: _env_bool("CONSOLE_SYNC", True))
+    #: 是否启用浏览器登录导入。
+    #:
+    #: 默认关闭：该功能依赖控制台的私有接口（无文档、无版本承诺），
+    #: 上游一改前端就可能失效。属于便利功能，不是必需路径 ——
+    #: 手动粘贴凭据始终可用。
+    browser_login: bool = field(default_factory=lambda: _env_bool("BROWSER_LOGIN", False))
 
     #: 上游请求超时（秒）
     request_timeout: float = field(default_factory=lambda: _env_float("REQUEST_TIMEOUT", 300.0))
@@ -261,6 +267,7 @@ class Settings:
             "console_base": self.console_base,
             "console_app_id": self.console_app_id,
             "console_sync": self.console_sync,
+            "browser_login": self.browser_login,
             "routing_mode": self.routing_mode,
             "affinity_ttl": self.affinity_ttl,
             "cooldown_seconds": self.cooldown_seconds,

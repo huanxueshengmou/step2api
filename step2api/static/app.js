@@ -1132,6 +1132,7 @@ async function refreshAll() {
 (function bootstrap() {
   $("#setAdminToken").value = state.token;
   refreshAll().catch((err) => toast("加载失败：" + err.message, "err"));
+  refreshLoginAvailability().catch(() => {});
   setInterval(checkHealth, 30000);
   setInterval(() => {
     if (state.tab === "overview") loadStats().catch(() => {});
@@ -1139,3 +1140,179 @@ async function refreshAll() {
 })();
 
 window.closeModal = closeModal;
+
+/* ------------------------------------------------------------------ */
+/* 浏览器登录导入                                                       */
+/* ------------------------------------------------------------------ */
+
+let loginPoll = null;
+
+async function refreshLoginAvailability() {
+  try {
+    const r = await api("/login/available");
+    const btn = $("#btnLoginImport");
+    if (btn) {
+      btn.disabled = !r.available;
+      btn.title = r.available
+        ? "打开浏览器窗口登录，自动抓取 API Key 与控制台凭据"
+        : (r.hint || "不可用");
+    }
+    return r;
+  } catch { return { available: false }; }
+}
+
+function openLoginModal() {
+  openModal("浏览器登录导入", `
+    <div class="form">
+      <p class="muted small">
+        会打开一个独立的浏览器窗口，请在窗口里正常登录
+        <a href="${esc(state.portal)}" target="_blank" rel="noreferrer">${esc(state.portal)}</a>。
+        登录完成后本页自动抓取该账号下的 <b>API Key</b> 与控制台凭据，无需手动复制粘贴。
+      </p>
+      <p class="muted small">
+        登录状态保存在服务端独立 profile 中，下次导入通常无需重新登录。
+        转发流量只用 API Key，控制台凭据仅用于查询套餐额度。
+      </p>
+      <p class="muted small">
+        <b>注意</b>：此功能依赖控制台未公开的私有接口，StepFun 改版后可能失效。
+        若失败，请改用「粘贴导入」并手动填写控制台凭据（见 README）。
+      </p>
+      <div id="loginBody" class="form"></div>
+    </div>`,
+    `<button class="btn" id="loginClose">关闭</button>
+     <button class="btn btn-primary" id="loginGo">打开登录窗口</button>`);
+
+  $("#loginClose").addEventListener("click", () => {
+    if (loginPoll) { clearInterval(loginPoll); loginPoll = null; }
+    closeModal();
+  });
+  $("#loginGo").addEventListener("click", startLogin);
+}
+
+async function startLogin() {
+  const btn = $("#loginGo");
+  if (!btn) return;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span> 启动中…';
+  try {
+    const r = await api("/login/start", { method: "POST", body: JSON.stringify({ timeout: 300 }) });
+    pollLogin(r.session.id);
+  } catch (err) {
+    toast(err.message, "err");
+    btn.disabled = false;
+    btn.textContent = "重试";
+  }
+}
+
+function renderLoginState(s) {
+  const box = $("#loginBody");
+  if (!box) return;
+  const pill = s.status === "success" ? "ok"
+    : (s.status === "failed" || s.status === "cancelled") ? "danger" : "info";
+  let html = `<div><span class="pill ${pill}">${esc(s.status)}</span>
+    <span class="muted small"> ${esc(s.message)} · ${s.elapsed}s</span></div>`;
+
+  if (s.plan_name) {
+    html += `<div class="list-item"><div class="grow">
+      <div>套餐 ${esc(s.plan_name)} <span class="muted small">${esc(s.plan_status || "")}</span></div>
+      <div class="muted small">
+        ${s.credits_remaining !== null
+          ? fmtNumber(s.credits_remaining) + " / " + fmtNumber(s.credits_total) + " Credit"
+          : "额度未知"}
+        ${s.expires_at ? " · 到期 " + fmtTime(s.expires_at) : ""}
+      </div></div></div>`;
+  }
+
+  if (s.keys && s.keys.length) {
+    html += `<label>选择要导入的 Key</label><div class="member-chips">`;
+    html += s.keys.map((k, i) => `
+      <label class="inline" style="min-width:250px">
+        <input type="checkbox" class="loginKey" value="${esc(k.key_id)}" ${i === 0 || k.is_default ? "checked" : ""}>
+        <span class="mono">${esc(k.hint)}</span>
+        <span class="muted small">${esc(k.name || "")}${k.is_default ? " · 默认" : ""}</span>
+      </label>`).join("");
+    html += `</div>
+      <label class="inline"><input type="checkbox" id="loginWithConsole" checked>
+        同时写入控制台凭据（用于展示真实套餐额度与到期时间）</label>
+      <div class="row">
+        <label>分组 <input id="loginGroup" value="default"></label>
+        <label>命名前缀 <input id="loginPrefix" placeholder="留空则用 Key 名称"></label>
+      </div>`;
+  }
+
+  if (s.error) html += `<div class="pill danger">${esc(s.error)}</div>`;
+  box.innerHTML = html;
+}
+
+function pollLogin(sid) {
+  if (loginPoll) clearInterval(loginPoll);
+  const tick = async () => {
+    try {
+      const r = await api(`/login/${sid}`);
+      const s = r.session;
+      renderLoginState(s);
+      if (s.status === "success" || s.status === "failed" || s.status === "cancelled") {
+        clearInterval(loginPoll); loginPoll = null;
+        const foot = $("#modalFoot");
+        if (!foot) return;
+        if (s.status === "success") {
+          foot.innerHTML = `<button class="btn" id="loginClose2">关闭</button>
+            <button class="btn btn-primary" id="loginCommit">导入选中的 Key</button>`;
+          $("#loginClose2").addEventListener("click", closeModal);
+          $("#loginCommit").addEventListener("click", () => commitLogin(sid));
+        } else {
+          foot.innerHTML = `<button class="btn" onclick="closeModal()">关闭</button>
+            <button class="btn" id="loginRetry">重试</button>`;
+          $("#loginRetry").addEventListener("click", () => { foot.innerHTML = ""; startLogin(); });
+        }
+      }
+    } catch (err) {
+      clearInterval(loginPoll); loginPoll = null;
+      toast(err.message, "err");
+    }
+  };
+  tick();
+  loginPoll = setInterval(tick, 1500);
+}
+
+async function commitLogin(sid) {
+  const btn = $("#loginCommit");
+  if (!btn) return;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span> 导入中…';
+  try {
+    const keyIds = $$(".loginKey:checked").map((el) => el.value);
+    const withConsole = $("#loginWithConsole") ? $("#loginWithConsole").checked : true;
+    const r = await api(`/login/${sid}/commit`, {
+      method: "POST",
+      body: JSON.stringify({
+        key_ids: keyIds,
+        with_console: withConsole,
+        group_name: ($("#loginGroup") || {}).value || "default",
+        name_prefix: ($("#loginPrefix") || {}).value || "",
+        verify: true,
+      }),
+    });
+    const ok = r.imported.filter((i) => i.verified && i.verified.ok).length;
+    toast(`导入完成：${r.total} 个账号，${ok} 个额度查询成功`, "ok");
+    closeModal();
+    await Promise.all([loadAccounts(), loadStats()]);
+  } catch (err) {
+    toast(err.message, "err");
+    btn.disabled = false;
+    btn.textContent = "导入选中的 Key";
+  }
+}
+
+(function bindLoginButton() {
+  const btn = $("#btnLoginImport");
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    const avail = await refreshLoginAvailability();
+    if (!avail.available) {
+      toast(avail.hint || "浏览器登录导入不可用", "warn");
+      return;
+    }
+    openLoginModal();
+  });
+})();
