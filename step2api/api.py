@@ -163,6 +163,8 @@ def serialize_account(row: Any, settings: Settings) -> dict:
         "console_error": data.get("console_error"),
         "console_expires_at": _iso(data.get("console_expires_at")),
         "console_seconds_left": _seconds_until(data.get("console_expires_at")),
+        "console_refresh_expires_at": _iso(data.get("console_refresh_exp")),
+        "console_refresh_seconds_left": _seconds_until(data.get("console_refresh_exp")),
         "five_hour_left_rate": data.get("five_hour_left_rate"),
         "five_hour_reset_at": _iso(data.get("five_hour_reset_at")),
         "weekly_left_rate": data.get("weekly_left_rate"),

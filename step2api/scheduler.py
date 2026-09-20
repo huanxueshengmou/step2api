@@ -172,6 +172,12 @@ class Scheduler:
         )
         quota = await client.fetch()
         snapshot = quota.as_snapshot()
+
+        # 自动续期成功则回写新 Cookie，后续刷新就不必再让用户重新登录
+        if quota.renewed_token:
+            self.store.set_console_credentials(account_id, quota.renewed_token, webid)
+            log.info("账号 #%s 控制台凭据已自动续期", account_id)
+
         self.store.update_account_console_quota(account_id, snapshot)
 
         if quota.ok and (quota.remaining_credits is None or quota.remaining_credits > 0):

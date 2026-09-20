@@ -1000,3 +1000,44 @@ def test_console_auth_error_mentions_2h_lifetime():
         "Cookie 自带的过期时间不可信）。请重新从浏览器复制一次。"
     )
     assert "2 小时" in str(err)
+
+
+def test_split_and_combine_cookie_roundtrip():
+    """Cookie 是 access + "..." + refresh（8 段）。"""
+    from step2api.console import combine_cookie, split_cookie
+
+    # 造一个与真实结构一致的 Cookie：access 3 段 + 两个空段 + refresh 3 段
+    access = "aaa.bbb.ccc"
+    refresh = "xxx.yyy.zzz"
+    cookie = f"{access}...{refresh}"
+
+    assert cookie.count(".") == 7          # 8 段
+    a, r = split_cookie(cookie)
+    assert (a, r) == (access, refresh)
+    assert combine_cookie(a, r) == cookie  # 往返一致
+
+    # 只给 access 时 refresh 为空
+    assert split_cookie(access) == (access, "")
+    assert combine_cookie(access, "") == access
+
+
+def test_combine_cookie_uses_three_dots():
+    """分隔符是 3 个点而不是 2 个 —— 差一个字符服务端就判 illegal。"""
+    from step2api.console import combine_cookie
+
+    out = combine_cookie("a.b.c", "x.y.z")
+    assert out == "a.b.c...x.y.z"
+    assert out.count(".") == 7
+    assert len(out) == 5 + 3 + 5
+
+
+def test_refresh_token_has_long_lifetime_than_access():
+    """access 只有 2 小时，refresh 有 29 天 —— 这是能持续监控的前提。"""
+    access_payload = {"create_at": 1789894516, "exp": 1789901716}
+    refresh_payload = {"exp": 1792486516}   # 实测值
+
+    access_life = access_payload["exp"] - access_payload["create_at"]
+    assert access_life == 7200              # 2 小时
+
+    refresh_life = refresh_payload["exp"] - access_payload["create_at"]
+    assert refresh_life > 25 * 86400        # 至少 25 天

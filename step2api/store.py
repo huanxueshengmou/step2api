@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     console_synced_at    TEXT,
     console_error        TEXT,
     console_expires_at   TEXT,
+    console_refresh_exp   TEXT,
 
     -- 控制台额度缓存
     five_hour_left_rate  REAL,
@@ -240,6 +241,7 @@ class Store:
             "console_synced_at": "TEXT",
             "console_error": "TEXT",
             "console_expires_at": "TEXT",
+            "console_refresh_exp": "TEXT",
             "five_hour_left_rate": "REAL",
             "five_hour_reset_at": "TEXT",
             "weekly_left_rate": "REAL",
@@ -482,6 +484,14 @@ class Store:
         webid = self._box.decrypt(row["console_webid_enc"] or "")
         return token, webid
 
+    def update_console_token(self, account_id: int, token: str) -> None:
+        """仅回写续期后的 Cookie（不动 web_id）。"""
+        self.execute(
+            "UPDATE accounts SET console_token_enc = ?, console_expires_at = NULL, "
+            "updated_at = ? WHERE id = ?",
+            (self._box.encrypt(token) if token else None, _now(), account_id),
+        )
+
     def clear_console_credentials(self, account_id: int) -> None:
         self.execute(
             "UPDATE accounts SET console_token_enc = NULL, console_webid_enc = NULL, "
@@ -508,6 +518,7 @@ class Store:
                 console_synced_at = ?,
                 console_error = CASE WHEN ? THEN NULL ELSE ? END,
                 console_expires_at = COALESCE(?, console_expires_at),
+                console_refresh_exp = COALESCE(?, console_refresh_exp),
                 five_hour_left_rate = COALESCE(?, five_hour_left_rate),
                 five_hour_reset_at = COALESCE(?, five_hour_reset_at),
                 weekly_left_rate = COALESCE(?, weekly_left_rate),
@@ -531,6 +542,7 @@ class Store:
                 1 if snapshot.get("ok") else 0,
                 snapshot.get("error"),
                 snapshot.get("credential_expires_at"),
+                snapshot.get("refresh_expires_at"),
                 snapshot.get("five_hour_left_rate"),
                 snapshot.get("five_hour_reset_at"),
                 snapshot.get("weekly_left_rate"),

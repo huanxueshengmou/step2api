@@ -24,7 +24,24 @@ Step Plan 订阅额度查询。真正的套餐额度、5 小时窗口与周窗�
 > ``Oasis-appID`` 必须为 20700，且 ``Oasis-Webid`` 取自 localStorage 而非 Cookie，
 > 缺任何一个都会返回 ``auth failed: oasis-token is embezzled``。
 
-**这是会话级凭据，会随退出登录失效**，与 API Key 相互独立。
+凭据结构与自动续期
+------------------
+
+控制台 Cookie 里的 ``Oasis-Token`` 其实是**两段 JWT 用三个点拼起来的**：
+
+    <access>...<refresh>            # 各 3 段，共 8 段（中间夹两个空段）
+
+* **access**  寿命仅 **2 小时**（``exp - create_at`` 恒为 7200 秒）
+* **refresh** 寿命 **29 天**，payload 里带 ``app_id`` / ``device_id``
+
+只有 access 过期时，用**完整的这两段**调
+
+    POST /passport/proto.api.passport.v1.PassportService/RefreshToken   {}
+
+即可换回一组新的 access + refresh（实测 access 过期后仍可刷新）。
+单独拿 refresh 去调会报 ``token is illegal`` —— 必须两段一起。
+
+因此只要每 29 天重新登录一次，额度就能持续自动更新。
 """
 
 from __future__ import annotations
@@ -84,6 +101,32 @@ def parse_token_expiry(token: str) -> datetime | None:
             except (OverflowError, OSError, ValueError):
                 return None
     return None
+
+
+def split_cookie(token: str) -> tuple[str, str]:
+    """把 Cookie 里的 Oasis-Token 拆成 ``(access, refresh)``。
+
+    结构是 ``<access>...<refresh>``（两个 JWT 之间夹两个空段，共 8 段）。
+    只给了 access（3 段）时 refresh 返回空串。
+    """
+    if not token:
+        return "", ""
+    parts = token.split(".")
+    if len(parts) >= 8:
+        return ".".join(parts[0:3]), ".".join(parts[5:8])
+    if len(parts) == 3:
+        return token, ""
+    return token, ""
+
+
+def combine_cookie(access: str, refresh: str) -> str:
+    """把 access 与 refresh 拼回 Cookie 形式（两段之间两个空点段）。"""
+    if not access:
+        return refresh
+    if not refresh:
+        return access
+    # 分隔符是三个点（access 与 refresh 各 3 段，中间夹两个空段）
+    return f"{access}...{refresh}"
 
 
 def _f(value: Any) -> float | None:
@@ -202,8 +245,12 @@ class ConsoleQuota:
     usage_records: list[dict] = field(default_factory=list)
     usage_total: int = 0
 
-    #: 凭据自身的到期时间（取自 JWT 的 exp，通常只有 2 小时）
+    #: 凭据自身的到期时间（access 的 exp，通常只有 2 小时）
     credential_expires_at: datetime | None = None
+    #: refresh 的到期时间（通常 29 天，决定多久要重新登录一次）
+    refresh_expires_at: datetime | None = None
+    #: 本次自动续期后的新 Cookie；非 None 时调用方应回写数据库
+    renewed_token: str | None = None
 
     error: str | None = None
     fetched_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -282,6 +329,10 @@ class ConsoleQuota:
             "credential_expires_at": (
                 self.credential_expires_at.isoformat() if self.credential_expires_at else None
             ),
+            "refresh_expires_at": (
+                self.refresh_expires_at.isoformat() if self.refresh_expires_at else None
+            ),
+            "renewed_token": self.renewed_token,
             "error": self.error,
             "probed_at": self.fetched_at.isoformat(),
         }
@@ -370,6 +421,54 @@ class ConsoleClient:
         except ValueError as exc:
             raise RuntimeError(f"{method} 返回非 JSON：{resp.text[:160]}") from exc
 
+    # -- 续期 -----------------------------------------------------------
+    async def refresh_session(self) -> str | None:
+        """用 refresh 换一组新的 access + refresh，返回新的完整 Cookie。
+
+        实测 **access 过期后依然可以刷新**（这是能持续监控的关键）。
+        必须带完整的两段凭据去调；只给 refresh 会返回 ``token is illegal``。
+        """
+        url = (
+            f"{self.base}/passport/proto.api.passport.v1"
+            f".PassportService/RefreshToken"
+        )
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Origin": self.base,
+            "Referer": self.base + "/",
+            "User-Agent": "step2api/1.0",
+            "oasis-appid": str(self.app_id),
+            "oasis-platform": "web",
+            "oasis-webid": self.webid,
+            "Oasis-Webid": self.webid,
+            "Oasis-Token": self.token,
+        }
+        kwargs: dict[str, Any] = {
+            "timeout": httpx.Timeout(self.settings.probe_timeout, connect=self.settings.connect_timeout),
+            "follow_redirects": False,
+        }
+        if self.proxy:
+            kwargs["proxy"] = self.proxy
+
+        async with httpx.AsyncClient(**kwargs) as client:
+            resp = await client.post(url, headers=headers, json={})
+
+        if resp.status_code != 200:
+            return None
+        try:
+            data = resp.json()
+        except ValueError:
+            return None
+
+        access = ((data.get("accessToken") or {}).get("raw") or "").strip()
+        refresh = ((data.get("refreshToken") or {}).get("raw") or "").strip()
+        if not access:
+            return None
+        if not refresh:
+            _, refresh = split_cookie(self.token)
+        return combine_cookie(access, refresh)
+
     # -- 公开方法 -------------------------------------------------------
     async def get_status(self) -> PlanStatus:
         data = await self._call("GetStepPlanStatus")
@@ -416,8 +515,45 @@ class ConsoleClient:
         return list(data.get("records") or []), int(data.get("total") or 0)
 
     async def fetch(self, *, with_usage: bool = False, usage_page_size: int = 20) -> ConsoleQuota:
-        """一次性拉取完整额度视图。"""
-        quota = ConsoleQuota(credential_expires_at=self.token_expires_at)
+        """一次性拉取完整额度视图。
+
+        access 过期时自动用 refresh 续期一次再重试；续期成功后会把新 Cookie
+        放在 ``quota.renewed_token`` 里，由调用方回写数据库。
+        """
+        # 先试一次。access 通常只有 2 小时，过期后必须靠 refresh 换新的。
+        quota = await self._fetch_once(with_usage=with_usage, usage_page_size=usage_page_size)
+        if quota.ok:
+            return quota
+
+        # 失败就尝试续期一次：不预先判断 exp —— 时钟偏差、服务端提前失效
+        # 都会让"看起来没过期"的凭据实际不可用，直接以请求结果为准更可靠。
+        renewed = await self.refresh_session()
+        if not renewed or renewed == self.token:
+            return quota
+
+        previous_token = self.token
+        self.token = renewed
+        self.token_expires_at = parse_token_expiry(renewed)
+        retry = await self._fetch_once(with_usage=with_usage, usage_page_size=usage_page_size)
+
+        if retry.ok:
+            retry.renewed_token = renewed
+            return retry
+
+        # 续期后的凭据也不好用 —— 回滚，把原始错误报给用户
+        self.token = previous_token
+        self.token_expires_at = parse_token_expiry(previous_token)
+        return quota
+
+    async def _fetch_once(
+        self, *, with_usage: bool = False, usage_page_size: int = 20
+    ) -> ConsoleQuota:
+        """拉取一次额度（不做续期）。"""
+        _, refresh_part = split_cookie(self.token)
+        quota = ConsoleQuota(
+            credential_expires_at=self.token_expires_at,
+            refresh_expires_at=parse_token_expiry(refresh_part),
+        )
         try:
             quota.status = await self.get_status()
             rate, buckets = await self.get_rate_limit()
@@ -451,7 +587,9 @@ class ConsoleClient:
 
 __all__ = [
     "BUCKET_TYPE",
+    "combine_cookie",
     "parse_token_expiry",
+    "split_cookie",
     "SUB_STATUS",
     "ConsoleAuthError",
     "ConsoleClient",
