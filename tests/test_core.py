@@ -28,8 +28,6 @@ from step2api.router import (
     extract_model,
     extract_session_key,
     select_channel,
-    should_cooldown,
-    should_failover,
 )
 from step2api.store import Store
 
@@ -256,12 +254,16 @@ def test_build_upstream_url_maps_both_channels():
     assert select_channel("/v1/messages", settings) == "api"
 
 
-def test_failover_predicates():
-    assert should_failover(429)
-    assert should_failover(503)
-    assert not should_failover(400)
-    assert should_cooldown(401)
-    assert not should_cooldown(400)
+def test_retry_and_punish_predicates():
+    """换账号 / 惩罚 的判定现在由错误分类器统一给出，不再硬编码状态码集合。"""
+    from step2api.errors import classify
+
+    assert classify(429).retryable and classify(429).punish
+    assert classify(503).retryable and classify(503).punish
+    assert classify(401).punish
+    # 请求本身的问题：既不换账号也不惩罚
+    bad = classify(400)
+    assert not bad.punish and not bad.point_rotate
 
 
 # --------------------------------------------------------------------------
@@ -347,12 +349,25 @@ def test_router_keeps_account_with_unknown_quota(store, settings):
 
 
 def test_router_respects_cooldown(store, settings):
+    """冷却中的账号不参与调度。
+
+    注意冷却现在由 note_failure()（按错误分类）负责设置，
+    mark_account_result 只记计数，不再自行算冷却。
+    """
+    from step2api.errors import ErrorKind, Classified
     from step2api.router import NoAccountAvailable
 
     a1 = store.create_account(name="a1", api_key="sk-key-aaaa-111111")
-    store.mark_account_result(
-        a1, success=False, error="boom", cooldown_seconds=300, fail_threshold=1
+    store.note_failure(
+        a1,
+        verdict=Classified(ErrorKind.RATE_LIMIT, "HTTP 429"),
+        base=300.0,
+        cap=3600.0,
     )
+    row = store.get_account(a1)
+    assert row["status"] == "cooldown"
+    assert row["cooldown_until"]
+
     router = Router(store, settings)
     with pytest.raises(NoAccountAvailable):
         router.plan(RouteContext(), attempts=2)
@@ -1041,3 +1056,183 @@ def test_refresh_token_has_long_lifetime_than_access():
 
     refresh_life = refresh_payload["exp"] - access_payload["create_at"]
     assert refresh_life > 25 * 86400        # 至少 25 天
+
+
+# --------------------------------------------------------------------------
+# 错误分类与冷却策略
+# --------------------------------------------------------------------------
+
+
+def test_classify_status_codes():
+    from step2api.errors import ErrorKind, classify
+
+    assert classify(401).kind is ErrorKind.AUTH
+    assert classify(403).kind is ErrorKind.AUTH
+    assert classify(402).kind is ErrorKind.CREDIT
+    assert classify(429).kind is ErrorKind.RATE_LIMIT
+    assert classify(500).kind is ErrorKind.SERVER
+    assert classify(503).kind is ErrorKind.SERVER
+
+
+def test_classify_429_beats_credit_keywords():
+    """429 的 body 常带 quota 措辞，必须先按状态码判成限流。
+
+    若先按关键词判成"余额耗尽"，会硬冷却到次日 —— 白扔一个只是被限流的账号。
+    """
+    from step2api.errors import ErrorKind, classify
+
+    v = classify(429, '{"error":{"message":"quota exceeded, insufficient balance"}}')
+    assert v.kind is ErrorKind.RATE_LIMIT, v.kind
+
+    # 没有状态码时，关键词才能生效
+    v2 = classify(None, "insufficient balance")
+    assert v2.kind is ErrorKind.CREDIT
+
+
+def test_classify_non_punishable_errors():
+    """请求本身的问题不该记账号的账。"""
+    from step2api.errors import ErrorKind, classify
+
+    ctx = classify(400, '{"error":{"message":"prompt is too long, maximum context length"}}')
+    assert ctx.kind is ErrorKind.CONTEXT_TOO_LONG
+    assert not ctx.punish
+    assert not ctx.point_rotate, "上下文超长换账号也没用"
+
+    bad = classify(400, '{"error":{"message":"invalid request parameter"}}')
+    assert bad.kind is ErrorKind.BAD_REQUEST
+    assert not bad.punish
+
+    filt = classify(400, '{"error":{"message":"blocked by content policy"}}')
+    assert filt.kind is ErrorKind.CONTENT_FILTER
+    assert not filt.punish
+
+
+def test_classify_transport_exceptions():
+    import httpx
+
+    from step2api.errors import ErrorKind, classify
+
+    assert classify(None, "", exception=httpx.ConnectTimeout("x")).kind is ErrorKind.TIMEOUT
+    assert classify(None, "", exception=httpx.ConnectError("boom")).kind is ErrorKind.NETWORK
+    assert classify(None, "", exception=httpx.ProxyError("bad proxy")).kind is ErrorKind.NETWORK
+    assert classify(None, "", exception=RuntimeError("weird")).kind is ErrorKind.UNKNOWN
+
+
+def test_cooldown_for_scales_by_kind():
+    from step2api.errors import ErrorKind, cooldown_for
+
+    # 限流：指数退避
+    assert cooldown_for(ErrorKind.RATE_LIMIT, 1, base=60, cap=3600) == 60
+    assert cooldown_for(ErrorKind.RATE_LIMIT, 2, base=60, cap=3600) == 120
+    assert cooldown_for(ErrorKind.RATE_LIMIT, 3, base=60, cap=3600) == 240
+    # 封顶
+    assert cooldown_for(ErrorKind.RATE_LIMIT, 99, base=60, cap=3600) == 3600
+
+    # 余额耗尽 / 鉴权失败：硬冷却，不指数（短冷却救不活）
+    assert cooldown_for(ErrorKind.CREDIT, 1, base=60, cap=3600, hard_until_seconds=21600) == 21600
+    assert cooldown_for(ErrorKind.AUTH, 5, base=60, cap=3600, hard_until_seconds=21600) == 21600
+
+    # 不惩罚的类型不冷却
+    assert cooldown_for(ErrorKind.BAD_REQUEST, 9, base=60, cap=3600) == 0
+
+
+def test_parse_retry_after_rejects_junk():
+    from step2api.errors import parse_retry_after
+
+    assert parse_retry_after("120") == 120.0
+    assert parse_retry_after(" 30 ") == 30.0
+    assert parse_retry_after(None) is None
+    assert parse_retry_after("") is None
+    # HTTP-Date 格式不支持，退回自己的退避
+    assert parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT") is None
+    # 荒谬值丢弃，避免把账号锁死一整天
+    assert parse_retry_after("0") is None
+    assert parse_retry_after("-5") is None
+    assert parse_retry_after("999999") is None
+
+
+def test_note_failure_does_not_extend_cooldown_while_cooling(store):
+    """关键：冷却期内反复失败**不得**把冷却越堆越长。
+
+    旧实现每次重试都 streak++ 并重新计冷却，导致一个账号被反复探测后
+    冷却时间指数膨胀到上限，实际上永远回不来。
+    """
+    from step2api.errors import Classified, ErrorKind
+
+    aid = store.create_account(name="a", api_key="sk-cd-key-0001")
+    v = Classified(ErrorKind.RATE_LIMIT, "HTTP 429")
+
+    first = store.note_failure(aid, verdict=v, base=60.0, cap=3600.0)
+    assert first["action"] == "cooldown"
+    until1 = store.get_account(aid)["cooldown_until"]
+
+    # 冷却期内再失败 5 次
+    for _ in range(5):
+        r = store.note_failure(aid, verdict=v, base=60.0, cap=3600.0)
+        assert r["action"] == "keep_cooldown", r
+
+    until2 = store.get_account(aid)["cooldown_until"]
+    assert until1 == until2, "冷却截止时间被反复探测推后了"
+    assert store.get_account(aid)["fail_streak"] == 1, "streak 不该在冷却期内增长"
+
+
+def test_note_failure_hard_cools_credit(store):
+    from step2api.errors import Classified, ErrorKind
+
+    aid = store.create_account(name="a", api_key="sk-cd-key-0002")
+    r = store.note_failure(
+        aid, verdict=Classified(ErrorKind.CREDIT, "余额耗尽"),
+        base=60.0, cap=3600.0, hard_seconds=21600.0,
+    )
+    assert r["action"] == "cooldown"
+    assert r["seconds"] == 21600.0, "余额耗尽应硬冷却而不是只退避 60 秒"
+
+
+def test_note_failure_skips_punishable_check_for_request_errors(store):
+    from step2api.errors import Classified, ErrorKind
+
+    aid = store.create_account(name="a", api_key="sk-cd-key-0003")
+    r = store.note_failure(
+        aid, verdict=Classified(ErrorKind.BAD_REQUEST, "参数错误"),
+        base=60.0, cap=3600.0,
+    )
+    assert r["action"] == "none"
+    row = store.get_account(aid)
+    assert row["status"] != "cooldown"
+    assert row["failure_count"] == 1, "仍应记计数供观测"
+
+
+def test_release_expired_cooldown_resets_streak(store):
+    """冷却到期要一并清零 streak，否则下次失败直接从高 streak 继续退避。"""
+    from step2api.errors import Classified, ErrorKind
+
+    aid = store.create_account(name="a", api_key="sk-cd-key-0004")
+    store.note_failure(
+        aid, verdict=Classified(ErrorKind.RATE_LIMIT, "429"), base=0.01, cap=3600.0
+    )
+    assert store.get_account(aid)["fail_streak"] == 1
+
+    import time
+    time.sleep(0.05)
+    store.release_expired_cooldowns()
+    row = store.get_account(aid)
+    assert row["status"] == "healthy"
+    assert row["fail_streak"] == 0
+
+
+def test_idle_bonus_prefers_long_unused(store, settings):
+    """闲置补偿：久未使用的账号得分更高，避免用量全压在少数账号上。"""
+    from step2api.router import Router
+
+    a1 = store.create_account(name="recent", api_key="sk-idle-000000000001")
+    a2 = store.create_account(name="idle", api_key="sk-idle-000000000002")
+    # a1 刚刚用过
+    store.execute(
+        "UPDATE accounts SET last_used_at = ? WHERE id = ?",
+        (__import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(), a1),
+    )
+    # a2 从未使用（last_used_at 为 NULL）→ 拿满额补偿
+    router = Router(store, settings)
+    r1 = router._score(dict(store.get_account(a1)))
+    r2 = router._score(dict(store.get_account(a2)))
+    assert r2 > r1, (r1, r2)

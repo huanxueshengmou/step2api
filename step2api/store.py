@@ -16,7 +16,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
@@ -609,32 +609,152 @@ class Store:
             )
             return
 
-        streak = int(row["fail_streak"] or 0) + 1
-        cooldown_until: str | None = None
-        status = "degraded"
-        if streak >= fail_threshold:
-            status = "cooldown"
-            from datetime import timedelta
+        # 失败路径的**冷却策略**已由 note_failure() 按错误分类处理，
+        # 这里只记计数与错误信息，不再自行计算冷却时长（避免两套策略打架）。
+        self.execute(
+            """
+            UPDATE accounts SET
+                failure_count = failure_count + 1,
+                total_requests = total_requests + 1,
+                last_error = ?,
+                last_used_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (error, now, now, account_id),
+        )
 
-            cooldown_until = (
-                datetime.now(timezone.utc) + timedelta(seconds=cooldown_seconds)
-            ).isoformat()
+    def note_failure(
+        self,
+        account_id: int,
+        *,
+        verdict: Any,
+        base: float,
+        cap: float,
+        hard_seconds: float = 6 * 3600,
+        degrade_threshold: int = 5,
+        degrade_seconds: float = 600.0,
+        retry_after: float | None = None,
+    ) -> dict:
+        """按**错误分类**记账，返回本次的处置结果。
+
+        与旧的「连续失败 N 次就固定冷却」相比，这里区分了几件事：
+
+        * **错误类型决定冷却量级** —— 限流短冷却指数退避，余额耗尽/鉴权失败
+          直接长冷却（这两种不会自己好，反复重试只是撞墙）。
+        * **已经在冷却中就不要越堆越厚** —— 这是最关键的一条。旧实现里每次
+          重试都会 ``streak++`` 并重新计冷却，导致一个账号被反复探测后
+          冷却时间指数膨胀到上限，实际上永远回不来。现在只有**真正进入一次
+          新冷却**时才推进 streak。
+        * **不该惩罚的错误绝不记账号的账** —— 参数错误、上下文超长、内容
+          拦截都是请求本身的问题，换账号也一样。
+        * **零散失败与反复失败分开** —— 认不出原因的失败先记「降级」（短时间
+          出池），达到阈值才升级为冷却。
+        """
+        from .errors import ErrorKind, cooldown_for
+
+        row = self.get_account(account_id)
+        if row is None:
+            return {}
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+
+        kind: ErrorKind = verdict.kind
+        if not verdict.punish:
+            # 不记账号的账，只累加失败计数（供观测）
+            self.execute(
+                "UPDATE accounts SET failure_count = failure_count + 1, "
+                "total_requests = total_requests + 1, last_used_at = ?, updated_at = ? "
+                "WHERE id = ?",
+                (now, now, account_id),
+            )
+            return {"action": "none", "kind": kind.value, "reason": verdict.reason}
+
+        currently_cooling = self._cooldown_active(row)
+        streak = int(row["fail_streak"] or 0)
+
+        # 已在冷却中：只记错误，不推进 streak、不延长冷却
+        if currently_cooling:
+            self.execute(
+                "UPDATE accounts SET failure_count = failure_count + 1, "
+                "total_requests = total_requests + 1, last_error = ?, "
+                "last_used_at = ?, updated_at = ? WHERE id = ?",
+                (verdict.reason, now, now, account_id),
+            )
+            return {"action": "keep_cooldown", "kind": kind.value, "reason": verdict.reason}
+
+        streak += 1
+        duration = cooldown_for(
+            kind, streak, base=base, cap=cap, hard_until_seconds=hard_seconds
+        )
+        if retry_after is not None and kind in (ErrorKind.RATE_LIMIT, ErrorKind.SERVER):
+            # 上游给了权威的重置时间，以它为准（不与自己的退避叠加）
+            duration = min(retry_after, cap)
+
+        if duration > 0:
+            until = (now_dt + timedelta(seconds=duration)).isoformat()
+            self.execute(
+                """
+                UPDATE accounts SET
+                    failure_count = failure_count + 1,
+                    total_requests = total_requests + 1,
+                    fail_streak = ?, status = 'cooldown',
+                    last_error = ?, cooldown_until = ?,
+                    last_used_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (streak, verdict.reason, until, now, now, account_id),
+            )
+            return {
+                "action": "cooldown", "kind": kind.value,
+                "seconds": round(duration, 1), "streak": streak,
+            }
+
+        # 不冷却的错误类型（如 4xx 里认不出的）：连败到阈值就短暂降级出池
+        if streak >= degrade_threshold:
+            until = (now_dt + timedelta(seconds=degrade_seconds)).isoformat()
+            self.execute(
+                """
+                UPDATE accounts SET
+                    failure_count = failure_count + 1,
+                    total_requests = total_requests + 1,
+                    fail_streak = ?, status = 'degraded',
+                    last_error = ?, cooldown_until = ?,
+                    last_used_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (streak, verdict.reason, until, now, now, account_id),
+            )
+            return {
+                "action": "degrade", "kind": kind.value,
+                "seconds": degrade_seconds, "streak": streak,
+            }
 
         self.execute(
             """
             UPDATE accounts SET
                 failure_count = failure_count + 1,
                 total_requests = total_requests + 1,
-                fail_streak = ?,
-                status = ?,
-                last_error = ?,
-                cooldown_until = ?,
-                last_used_at = ?,
-                updated_at = ?
+                fail_streak = ?, status = 'degraded', last_error = ?,
+                last_used_at = ?, updated_at = ?
             WHERE id = ?
             """,
-            (streak, status, error, cooldown_until, now, now, account_id),
+            (streak, verdict.reason, now, now, account_id),
         )
+        return {"action": "degrade_light", "kind": kind.value, "streak": streak}
+
+    @staticmethod
+    def _cooldown_active(row: Any) -> bool:
+        until = row["cooldown_until"] if not isinstance(row, dict) else row.get("cooldown_until")
+        if not until:
+            return False
+        try:
+            deadline = datetime.fromisoformat(str(until))
+        except ValueError:
+            return False
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        return deadline > datetime.now(timezone.utc)
 
     def clear_cooldown(self, account_id: int) -> None:
         self.execute(
@@ -643,12 +763,17 @@ class Store:
             (_now(), account_id),
         )
 
-
     def release_expired_cooldowns(self) -> int:
+        """冷却到期的账号恢复参选。
+
+        注意 ``fail_streak`` 一并清零：冷却结束意味着给它一次干净的机会，
+        否则下次失败会直接从高 streak 继续指数退避，等于永久惩罚。
+        """
         now = _now()
         return self.execute(
             "UPDATE accounts SET status = 'healthy', cooldown_until = NULL, fail_streak = 0 "
-            "WHERE status = 'cooldown' AND cooldown_until IS NOT NULL AND cooldown_until <= ?",
+            "WHERE status IN ('cooldown', 'degraded') "
+            "AND cooldown_until IS NOT NULL AND cooldown_until <= ?",
             (now,),
         )
 

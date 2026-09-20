@@ -183,16 +183,28 @@ class Settings:
     routing_mode: str = field(default_factory=lambda: _env("ROUTING_MODE", "sticky") or "sticky")
     #: 会话粘性保留时长（秒），默认 6 小时
     affinity_ttl: float = field(default_factory=lambda: _env_float("AFFINITY_TTL", 6 * 3600))
-    #: 失败账号冷却时长（秒）
+    #: 失败账号冷却**基数**（秒）。实际时长按错误类型与连续次数指数退避。
     cooldown_seconds: float = field(default_factory=lambda: _env_float("COOLDOWN", 60.0))
+    #: 冷却上限（秒）。指数退避封顶，避免一个账号被锁太久。
+    cooldown_max_seconds: float = field(
+        default_factory=lambda: _env_float("COOLDOWN_MAX", 3600.0)
+    )
     #: 单次请求最多尝试的账号数
     max_retries: int = field(default_factory=lambda: _env_int("MAX_RETRIES", 3))
     #: 账号并发上限（账号自身 max_concurrency 为 0 时使用）
     default_max_concurrency: int = field(
         default_factory=lambda: _env_int("DEFAULT_MAX_CONCURRENCY", 8)
     )
-    #: 连续失败多少次后标记为故障
+    #: 连续失败多少次后标记为故障（用于"降级"判定）
     fail_threshold: int = field(default_factory=lambda: _env_int("FAIL_THRESHOLD", 5))
+
+    # -- 加权调度 --------------------------------------------------------
+    #: 闲置补偿：账号每闲置 1 小时增加的权重
+    idle_weight_per_hour: float = field(
+        default_factory=lambda: _env_float("IDLE_WEIGHT_PER_HOUR", 0.5)
+    )
+    #: 闲置补偿上限
+    idle_weight_max: float = field(default_factory=lambda: _env_float("IDLE_WEIGHT_MAX", 5.0))
 
     # -- 额度刷新 --------------------------------------------------------
     refresh_interval: float = field(default_factory=lambda: _env_float("REFRESH_INTERVAL", 300.0))
@@ -271,8 +283,11 @@ class Settings:
             "routing_mode": self.routing_mode,
             "affinity_ttl": self.affinity_ttl,
             "cooldown_seconds": self.cooldown_seconds,
+            "cooldown_max_seconds": self.cooldown_max_seconds,
             "max_retries": self.max_retries,
             "default_max_concurrency": self.default_max_concurrency,
+            "idle_weight_per_hour": self.idle_weight_per_hour,
+            "idle_weight_max": self.idle_weight_max,
             "refresh_interval": self.refresh_interval,
             "low_quota_ratio": self.low_quota_ratio,
             "proxy_strategy": self.proxy_strategy,

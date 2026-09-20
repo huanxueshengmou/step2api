@@ -277,17 +277,48 @@ class Router:
         return True, "ok"
 
     # -- 账号排序 -------------------------------------------------------
+    def _idle_bonus(self, row: dict) -> float:
+        """闲置补偿：越久没被用到的账号，权重越高。
+
+        没有它的话，打分靠前的账号会被反复选中，靠后的永远闲着 —— 用量全压在
+        少数账号上，既浪费额度也不利于摊薄风险。按闲置时长线性加成并封顶
+        （``idle_weight_max``），从未使用过的给满额补偿。
+        """
+        per_hour = self.settings.idle_weight_per_hour
+        cap = self.settings.idle_weight_max
+        if per_hour <= 0 or cap <= 0:
+            return 0.0
+        last = row.get("last_used_at")
+        if not last:
+            return cap
+        try:
+            ts = datetime.fromisoformat(str(last))
+        except ValueError:
+            return cap
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        hours = max(0.0, (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0)
+        return min(hours * per_hour, cap)
+
     def _score(self, row: dict) -> float:
-        """综合得分：额度越充足、权重越高、在途越少，得分越高。"""
+        """综合得分。
+
+        三个因子相乘，再加闲置补偿：
+
+        * **额度充足度** —— 剩余比例；未知时给中性值 0.5，不因查不到就压权
+        * **权重** —— 账号自身配置的 weight
+        * **在途惩罚** —— 1/(1+在途数)，避免把并发压到同一个账号
+        * **闲置补偿** —— 加法项，防止高分账号被反复选中
+
+        注意这里**不使用"成功率"**。历史累计成功率会让早期出过错的账号被永久
+        压权且永不恢复；瞬时健康度已由冷却/降级机制承接。
+        """
         _, percent = self._quota_state(row)
         quota_factor = percent if percent is not None else 0.5
         weight = max(1, int(row.get("weight") or 1))
         inflight = self.gate.inflight(int(row["id"]))
         inflight_penalty = 1.0 / (1.0 + inflight)
-        # 近期失败过的账号略微降权
-        fail_streak = int(row.get("fail_streak") or 0)
-        reliability = 1.0 / (1.0 + fail_streak * 0.5)
-        return quota_factor * weight * inflight_penalty * reliability
+        return (quota_factor * weight * inflight_penalty) + self._idle_bonus(row)
 
     def _order(self, rows: Sequence[dict], mode: str) -> list[dict]:
         rows = list(rows)
@@ -644,14 +675,6 @@ class RouteAttempt:
     usage: dict = field(default_factory=dict)
 
 
-def should_failover(status_code: int) -> bool:
-    """哪些上游状态码值得换账号重试。"""
-    return status_code in (401, 402, 403, 408, 409, 425, 429, 500, 502, 503, 504, 529)
-
-
-def should_cooldown(status_code: int) -> bool:
-    """哪些状态码说明该账号本身有问题，需要冷却。"""
-    return status_code in (401, 402, 403, 429, 500, 502, 503, 504, 529)
 
 
 def parse_usage(payload: Any) -> dict:

@@ -23,6 +23,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .config import Settings
+from .errors import classify, parse_retry_after
 from .proxy import normalize_proxy
 from .router import (
     NoAccountAvailable,
@@ -34,8 +35,6 @@ from .router import (
     extract_session_key,
     parse_usage,
     select_channel,
-    should_cooldown,
-    should_failover,
 )
 from .store import Store
 
@@ -315,13 +314,18 @@ class Gateway:
                     upstream = await client.send(upstream_request, stream=True)
                 except httpx.HTTPError as exc:
                     last_error = f"{type(exc).__name__}: {exc}"
-                    self.store.mark_account_result(
+                    verdict = classify(None, "", exception=exc)
+                    self.store.note_failure(
                         target.account_id,
-                        success=False,
-                        error=last_error,
-                        cooldown_seconds=self.settings.cooldown_seconds,
-                        fail_threshold=self.settings.fail_threshold,
+                        verdict=verdict,
+                        base=self.settings.cooldown_seconds,
+                        cap=self.settings.cooldown_max_seconds,
+                        degrade_threshold=self.settings.fail_threshold,
                     )
+                    # 换账号也无意义的失败（请求本身的问题）不必再试
+                    if not verdict.point_rotate:
+                        last_error = f"{verdict.reason}（不换账号重试）"
+                        break
                     duration = (time.perf_counter() - attempt_started) * 1000.0
                     if log_callback:
                         log_callback(
@@ -343,8 +347,8 @@ class Gateway:
 
                 status = upstream.status_code
 
-                # 可重试的上游错误 → 换账号（尚未向客户端吐出任何字节）
-                if should_failover(status) and attempts < len(plan):
+                # 先读 body 再决定 —— 分类需要看响应内容，且尚未向客户端吐字节
+                if status >= 400:
                     body_preview = b""
                     try:
                         body_preview = await upstream.aread()
@@ -353,20 +357,52 @@ class Gateway:
                     await upstream.aclose()
 
                     error_text = body_preview[:400].decode("utf-8", errors="ignore")
-                    last_error = f"HTTP {status}: {error_text}"
-                    if should_cooldown(status):
-                        self.store.mark_account_result(
-                            target.account_id,
-                            success=False,
-                            error=last_error,
-                            cooldown_seconds=self.settings.cooldown_seconds,
-                            fail_threshold=self.settings.fail_threshold,
-                        )
+                    verdict = classify(
+                        status,
+                        body_preview.decode("utf-8", errors="ignore"),
+                        exception=None,
+                    )
+                    last_error = f"{verdict.reason}: {error_text}"
+
+                    self.store.note_failure(
+                        target.account_id,
+                        verdict=verdict,
+                        base=self.settings.cooldown_seconds,
+                        cap=self.settings.cooldown_max_seconds,
+                        degrade_threshold=self.settings.fail_threshold,
+                        retry_after=parse_retry_after(upstream.headers.get("retry-after")),
+                    )
+
                     # 走了粘性账号但失败了，把它从会话里摘掉
                     if target.sticky and ctx.session_key:
                         self.store.drop_session(ctx.session_key)
                         ctx.session_key = None
-                    duration = (time.perf_counter() - attempt_started) * 1000.0
+
+                    if attempts < len(plan) and verdict.retryable and verdict.point_rotate:
+                        duration = (time.perf_counter() - attempt_started) * 1000.0
+                        if log_callback:
+                            log_callback(
+                                GatewayResult(
+                                    account_id=target.account_id,
+                                    account_name=target.account_name,
+                                    proxy_label=target.proxy.display_label(),
+                                    attempts=attempts,
+                                    status_code=status,
+                                    channel=channel,
+                                    duration_ms=duration,
+                                    error=last_error,
+                                ),
+                                ctx,
+                                request.method,
+                                path,
+                            )
+                        continue
+
+                    # 不再重试：把这个错误原样回给客户端
+                    resp_headers = _filter_response_headers(upstream.headers)
+                    resp_headers["x-step2api-account"] = str(target.account_id)
+                    resp_headers["x-step2api-proxy"] = target.proxy.header_value()
+                    resp_headers["x-step2api-attempt"] = str(attempts)
                     if log_callback:
                         log_callback(
                             GatewayResult(
@@ -376,27 +412,23 @@ class Gateway:
                                 attempts=attempts,
                                 status_code=status,
                                 channel=channel,
-                                duration_ms=duration,
+                                duration_ms=(time.perf_counter() - attempt_started) * 1000.0,
                                 error=last_error,
                             ),
                             ctx,
                             request.method,
                             path,
                         )
-                    continue
-
-                # 成功（或不可重试的错误）→ 直接回给客户端
-                if 200 <= status < 300:
-                    self.store.mark_account_result(target.account_id, success=True)
-                    self.router.commit(ctx, target)
-                else:
-                    self.store.mark_account_result(
-                        target.account_id,
-                        success=False,
-                        error=f"HTTP {status}",
-                        cooldown_seconds=self.settings.cooldown_seconds,
-                        fail_threshold=self.settings.fail_threshold,
+                    return Response(
+                        content=body_preview,
+                        status_code=status,
+                        headers=resp_headers,
+                        media_type=upstream.headers.get("content-type"),
                     )
+
+                # 走到这里只可能是 2xx（4xx/5xx 已在上面处理完）
+                self.store.mark_account_result(target.account_id, success=True)
+                self.router.commit(ctx, target)
 
                 resp_headers = _filter_response_headers(upstream.headers)
                 resp_headers["x-step2api-account"] = str(target.account_id)

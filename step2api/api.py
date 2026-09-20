@@ -94,7 +94,7 @@ def _parse_dt(value: Any) -> datetime | None:
     return dt
 
 
-def serialize_account(row: Any, settings: Settings) -> dict:
+def serialize_account(row: Any, settings: Settings, inflight: int = 0) -> dict:
     data = dict(row)
     remaining = data.get("credits_remaining")
     total = data.get("credits_total")
@@ -178,6 +178,7 @@ def serialize_account(row: Any, settings: Settings) -> dict:
         "success_count": data.get("success_count"),
         "failure_count": data.get("failure_count"),
         "total_requests": data.get("total_requests"),
+        "inflight": inflight,
         "last_used_at": _iso(data.get("last_used_at")),
         "created_at": _iso(data.get("created_at")),
         "updated_at": _iso(data.get("updated_at")),
@@ -363,7 +364,8 @@ class RoutingUpdate(BaseModel):
     routing_mode: RoutingMode | None = None
     proxy_strategy: ProxyStrategy | None = None
     affinity_ttl: float | None = Field(default=None, ge=60, le=30 * 86400)
-    cooldown_seconds: float | None = Field(default=None, ge=0, le=3600)
+    cooldown_seconds: float | None = Field(default=None, ge=0, le=86400)
+    cooldown_max_seconds: float | None = Field(default=None, ge=0, le=86400)
     max_retries: int | None = Field(default=None, ge=1, le=10)
     default_max_concurrency: int | None = Field(default=None, ge=1, le=1000)
     refresh_interval: float | None = Field(default=None, ge=30, le=86400)
@@ -578,8 +580,11 @@ async def list_accounts(
     store = _store(request)
     settings = _settings(request)
     rows = store.list_accounts(enabled_only=enabled_only, group_name=group)
+    live = request.app.state.router.gate.snapshot()
     return {
-        "accounts": [serialize_account(r, settings) for r in rows],
+        "accounts": [
+            serialize_account(r, settings, inflight=live.get(int(r["id"]), 0)) for r in rows
+        ],
         "groups": sorted({(r["group_name"] or "default") for r in store.list_accounts()}),
     }
 
@@ -636,7 +641,8 @@ async def get_account(request: Request, account_id: int) -> dict:
     row = store.get_account(account_id)
     if row is None:
         raise HTTPException(status_code=404, detail="账号不存在")
-    return {"account": serialize_account(row, settings)}
+    live = request.app.state.router.gate.snapshot()
+    return {"account": serialize_account(row, settings, inflight=live.get(account_id, 0))}
 
 
 @router.patch("/accounts/{account_id}", dependencies=guard)
@@ -1327,6 +1333,7 @@ async def stats(request: Request) -> dict:
             "enabled": sum(1 for a in accounts if a["enabled"]),
             "healthy": by_status.get("healthy", 0),
             "cooldown": by_status.get("cooldown", 0),
+            "degraded": by_status.get("degraded", 0),
             "low_quota": sum(1 for a in accounts if a["low_quota"]),
             "quota_ok": sum(1 for a in accounts if a["quota_ok"]),
             "by_status": by_status,
@@ -1390,6 +1397,7 @@ async def update_routing(request: Request, payload: RoutingUpdate) -> dict:
     for field in (
         "affinity_ttl",
         "cooldown_seconds",
+        "cooldown_max_seconds",
         "max_retries",
         "default_max_concurrency",
         "refresh_interval",

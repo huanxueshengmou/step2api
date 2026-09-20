@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 import httpx
@@ -272,7 +273,9 @@ def main() -> int:
     print("\n[11] 凭据加密（落库不含明文）")
     import sqlite3
 
-    db = sqlite3.connect("C:/Users/huanxue/AppData/Local/Temp/s2a_smoke/step2api.db")
+    # 库路径跟着 STEP2API_DATA_DIR 走，别硬编码，否则换目录就断
+    data_dir = os.environ.get("STEP2API_DATA_DIR", "./data")
+    db = sqlite3.connect(os.path.join(data_dir, "step2api.db"))
     rows = db.execute("SELECT api_key_enc, key_hint FROM accounts").fetchall()
     check("数据库无 Key 明文",
           all("sk-gooda-000000000002" not in (r[0] or "") for r in rows),
