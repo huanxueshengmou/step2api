@@ -31,7 +31,7 @@ from typing import Any
 
 import httpx
 
-from .config import CONSOLE_APP_ID, PORTAL_URL, Settings
+from .config import CONSOLE_APP_ID, Settings
 from .console import ConsoleClient
 from .crypto import key_hint
 
@@ -52,9 +52,12 @@ BROWSER_CHANNELS = ("chrome", "msedge")
 #: 而 ``account.stepfun.ai`` 是账号中心。两者的 Cookie 与 localStorage 是
 #: **按域隔离**的，只读其中一个经常拿不到完整凭据，所以两个都试。
 CANDIDATE_ORIGINS = (
-    "https://platform.stepfun.ai",
     "https://account.stepfun.ai",
+    "https://platform.stepfun.ai",
 )
+
+#: 打开登录窗口时的落地页（用户在这里完成登录）
+LOGIN_URL = "https://account.stepfun.ai/"
 
 
 class PlaywrightMissing(RuntimeError):
@@ -238,7 +241,7 @@ class LoginManager:
             page = pages[0] if pages else await context.new_page()
             session.message = "已打开浏览器窗口，请完成登录"
             with contextlib.suppress(Exception):
-                await page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=45000)
+                await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
 
             deadline = time.monotonic() + timeout
             last_detail = ""
@@ -246,18 +249,28 @@ class LoginManager:
                 if session.status == "cancelled":
                     return
 
-                # 逐个站点试：会话通常落在 platform 上，但凭据按域隔离
+                # 轮询期间**绝不导航**：用户可能正在输密码或过验证码，
+                # 任何 page.goto 都会把页面跳走，登录永远完不成。
+                any_creds = False
                 for origin in CANDIDATE_ORIGINS:
                     creds = await self._read_credentials(context, page, origin)
                     if not creds:
                         continue
+                    any_creds = True
                     token, webid = creds
-                    session.message = f"已登录（{origin.split('//')[1]}），正在读取 API Key…"
+                    # 注意：拿到 cookie 不等于已登录 —— 全新 profile 一打开站点就会
+                    # 被种下一套匿名会话。只有接口成功返回才算真的登录成功。
                     ok, detail = await self._collect(session, token, webid, origin)
                     if ok:
                         return
                     last_detail = f"{origin}: {detail}"
-                    session.message = f"已登录，但读取 Key 失败：{detail}"
+                    if "not a logined oasis account" in detail:
+                        session.message = "等待登录…（当前是匿名会话，请在窗口里登录）"
+                    else:
+                        session.message = f"凭据读取受阻：{detail}"
+
+                if not any_creds:
+                    session.message = "等待登录…（请在浏览器窗口完成登录）"
 
                 await asyncio.sleep(POLL_INTERVAL)
 
@@ -295,11 +308,11 @@ class LoginManager:
     ) -> tuple[str, str] | None:
         """读取指定站点下的 Oasis-Token（Cookie）与 web_id（localStorage）。
 
-        两者都按域隔离，所以必须有针对性地访问该站点后再各取一份。
+        **只读取、不导航** —— 保持用户当前页面不动。代价是：localStorage 是按域
+        隔离的，若用户登录的站点与 ``origin`` 不同，就只能在用户恰好处于该域的
+        页面上时才读到 web_id。窗口固定在 account.stepfun.ai 打开正是为了让
+        这一点成立。
         """
-        with contextlib.suppress(Exception):
-            await page.goto(origin + "/", wait_until="domcontentloaded", timeout=20000)
-
         token = ""
         with contextlib.suppress(Exception):
             for cookie in await context.cookies(origin + "/"):

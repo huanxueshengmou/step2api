@@ -289,7 +289,11 @@ function renderAccounts() {
           ? `<div class="muted small">周 ${(a.weekly_left_rate * 100).toFixed(0)}%</div>` : ""}
         ${a.console_error
           ? `<div class="muted small truncate" title="${esc(a.console_error)}">控制台：${esc(a.console_error.slice(0, 28))}…</div>`
-          : (a.console_configured ? "" : `<div class="muted small">未配控制台</div>`)}
+          : (a.console_configured
+              ? (a.console_seconds_left !== null && a.console_seconds_left !== undefined
+                  ? `<div class="muted small ${a.console_seconds_left < 600 ? "pill warn" : ""}">凭据剩 ${fmtDuration(a.console_seconds_left)}</div>`
+                  : "")
+              : `<div class="muted small">未配控制台</div>`)}
       </td>
       <td class="w-quota">
         <div>${quotaText}${a.low_quota ? ' <span class="pill warn">告警</span>' : ""}</div>
@@ -1176,6 +1180,11 @@ function openLoginModal() {
       <p class="muted small">
         <b>注意</b>：此功能依赖控制台未公开的私有接口，StepFun 改版后可能失效。
         若失败，请改用「粘贴导入」并手动填写控制台凭据（见 README）。
+      </p>
+      <p class="muted small">
+        <b>另一个限制</b>：控制台凭据（Oasis-Token）<b>实际寿命只有约 2 小时</b>
+        —— Cookie 自带的过期时间（写着 2027 年）不可信，要以其 JWT 里的 exp 为准。
+        过期后套餐额度会停止刷新并显示过期提示。
       </p>
       <div id="loginBody" class="form"></div>
     </div>`,

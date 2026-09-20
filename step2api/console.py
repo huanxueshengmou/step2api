@@ -29,6 +29,8 @@ Step Plan 订阅额度查询。真正的套餐额度、5 小时窗口与周窗�
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -49,6 +51,39 @@ SUB_STATUS = {0: "unknown", 1: "active", 2: "expired", 3: "cancelled", 4: "pendi
 
 #: Credit 桶类型（plan_credit_rate_limit.credit_buckets[].type）
 BUCKET_TYPE = {0: "unspecified", 1: "subscription", 2: "topup"}
+
+
+def parse_token_expiry(token: str) -> datetime | None:
+    """从 Oasis-Token 里解出真实到期时间。
+
+    这个 token 是 ``header.payload.signature`` 结构（后面还跟了几段私有数据），
+    payload 里有 ``exp``。**必须看它，不能信 Cookie 的 expires 字段** ——
+    实测 Cookie 自称 2027 年过期，而 exp 只给 2 小时。
+
+    只读不验签：这里只用来做"还剩多久"的提示，安全性由服务端判断。
+    """
+    if not token:
+        return None
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+
+    for index in (1, 0):
+        segment = parts[index]
+        padded = segment + "=" * (-len(segment) % 4)
+        try:
+            payload = json.loads(base64.urlsafe_b64decode(padded))
+        except (ValueError, TypeError, UnicodeDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        exp = payload.get("exp")
+        if isinstance(exp, (int, float)) and exp > 0:
+            try:
+                return datetime.fromtimestamp(float(exp), tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
+    return None
 
 
 def _f(value: Any) -> float | None:
@@ -167,6 +202,9 @@ class ConsoleQuota:
     usage_records: list[dict] = field(default_factory=list)
     usage_total: int = 0
 
+    #: 凭据自身的到期时间（取自 JWT 的 exp，通常只有 2 小时）
+    credential_expires_at: datetime | None = None
+
     error: str | None = None
     fetched_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -211,6 +249,13 @@ class ConsoleQuota:
             return None
         return int((self.reset_at - datetime.now(timezone.utc)).total_seconds())
 
+    @property
+    def credential_seconds_left(self) -> int | None:
+        """凭据还有多久失效。用于在界面上提示"这个数字的有效期"。"""
+        if self.credential_expires_at is None:
+            return None
+        return int((self.credential_expires_at - datetime.now(timezone.utc)).total_seconds())
+
     def as_snapshot(self) -> dict:
         """转成 ``store.update_account_quota`` 认识的字段。"""
         return {
@@ -234,6 +279,9 @@ class ConsoleQuota:
                 self.weekly_reset_at.isoformat() if self.weekly_reset_at else None
             ),
             "auto_renew": 1 if self.status.auto_renew else 0,
+            "credential_expires_at": (
+                self.credential_expires_at.isoformat() if self.credential_expires_at else None
+            ),
             "error": self.error,
             "probed_at": self.fetched_at.isoformat(),
         }
@@ -267,6 +315,7 @@ class ConsoleClient:
         self.base = (base or CONSOLE_BASE).rstrip("/")
         self.proxy = normalize_proxy(proxy) if proxy else None
         self.settings = settings
+        self.token_expires_at = parse_token_expiry(self.token)
 
     # -- 内部 -----------------------------------------------------------
     def _headers(self) -> dict[str, str]:
@@ -300,6 +349,11 @@ class ConsoleClient:
                 detail = resp.json().get("message", "")
             except ValueError:
                 detail = resp.text[:120]
+            if "expired" in detail.lower():
+                raise ConsoleAuthError(
+                    "控制台凭据已过期（Oasis-Token 实测寿命约 2 小时，"
+                    "Cookie 自带的过期时间不可信）。请重新从浏览器复制一次。"
+                )
             if "embezzled" in detail:
                 raise ConsoleAuthError(
                     "控制台凭据被拒绝：Oasis-appID 必须为 20700，且 Oasis-Webid 需取自"
@@ -363,7 +417,7 @@ class ConsoleClient:
 
     async def fetch(self, *, with_usage: bool = False, usage_page_size: int = 20) -> ConsoleQuota:
         """一次性拉取完整额度视图。"""
-        quota = ConsoleQuota()
+        quota = ConsoleQuota(credential_expires_at=self.token_expires_at)
         try:
             quota.status = await self.get_status()
             rate, buckets = await self.get_rate_limit()
@@ -397,6 +451,7 @@ class ConsoleClient:
 
 __all__ = [
     "BUCKET_TYPE",
+    "parse_token_expiry",
     "SUB_STATUS",
     "ConsoleAuthError",
     "ConsoleClient",

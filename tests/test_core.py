@@ -956,3 +956,47 @@ def test_store_migration_adds_console_columns(tmp_path):
     assert row["console_token_enc"] is None
     assert row["weekly_left_rate"] is None
     st.close()
+
+
+# --------------------------------------------------------------------------
+# 控制台凭据寿命
+# --------------------------------------------------------------------------
+
+
+def test_parse_token_expiry_reads_jwt_exp():
+    """Cookie 自称 2027 年过期，真实寿命要看 JWT 的 exp。"""
+    import base64
+    import json as _json
+    from datetime import datetime, timezone
+
+    from step2api.console import parse_token_expiry
+
+    payload = {"exp": 1789901716, "create_at": 1789894516, "oasis_id": 412887770240196608}
+    seg = base64.urlsafe_b64encode(_json.dumps(payload).encode()).decode().rstrip("=")
+    token = f"eyJhbGciOiJIUzI1NiJ9.{seg}.sigsigsig.extra.segments.here"
+
+    exp = parse_token_expiry(token)
+    assert exp == datetime.fromtimestamp(1789901716, tz=timezone.utc)
+
+    # 实测寿命恰好 2 小时
+    assert payload["exp"] - payload["create_at"] == 7200
+
+
+def test_parse_token_expiry_handles_garbage():
+    from step2api.console import parse_token_expiry
+
+    assert parse_token_expiry("") is None
+    assert parse_token_expiry("not-a-token") is None
+    assert parse_token_expiry("a.b") is None
+    assert parse_token_expiry("x.!!!notbase64!!!.y") is None
+
+
+def test_console_auth_error_mentions_2h_lifetime():
+    """过期时提示要说明真实寿命，避免用户以为 Cookie 的 2027 年可信。"""
+    from step2api.console import ConsoleAuthError
+
+    err = ConsoleAuthError(
+        "控制台凭据已过期（Oasis-Token 实测寿命约 2 小时，"
+        "Cookie 自带的过期时间不可信）。请重新从浏览器复制一次。"
+    )
+    assert "2 小时" in str(err)

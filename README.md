@@ -103,6 +103,12 @@ pip install playwright     # 复用系统已装的 Chrome/Edge，无需 playwrig
 > ⚠️ 这个功能依赖控制台**未公开的私有接口**（`/api/step.openapi.devcenter.Dashboard/*`），
 > 官方无文档、无版本承诺，前端改版后随时可能失效。所以它默认关闭，且不应作为
 > 唯一的导入路径。失效时请回退到方式一。
+>
+> **实测状态：未跑通。** 浏览器能启动、能读到两个站点的凭据，但接口返回
+> `not a logined oasis account`。另外 Chrome 运行时会**排他锁定** Cookie 数据库
+> （只读模式、`immutable` 模式、PowerShell 共享读均失败），要读原始 Cookie
+> 必须先完全退出 Chrome。相比之下，手工导出 Cookie 三秒就能完成，
+> 因此**推荐用方式一 + 手动粘贴凭据**。
 
 #### 粘贴格式
 
@@ -207,6 +213,11 @@ POST https://account.stepfun.ai/api/step.openapi.devcenter.Dashboard/QueryStepPl
 3. F12 → Console → 执行 `localStorage.getItem("web_id")`，复制结果
 4. 控制台「账号 → 编辑」填入这两个值，保存即自动校验并同步
 
+> 取值时注意：Chrome 里多个账号的 `Oasis-Token` 是**按账号隔离**的。
+> 如果你开了多个 profile，请确认当前页面所在的 profile 就是你想要的那个账号
+> （地址栏 `chrome://version` 可看「个人资料路径」）。凭据与账号不匹配时，
+> 会返回 `You do not have an active subscription` 而不是报错，容易误判。
+
 也可以随导入一起提供，或走 API：
 
 ```bash
@@ -229,8 +240,17 @@ curl -X POST http://127.0.0.1:8787/api/accounts/1/console   -H 'Content-Type: ap
 }
 ```
 
-> 控制台凭据是**会话级**的，退出登录或改密会失效，与 API Key 相互独立。
-> 转发流量始终用 API Key，只有查额度才用这套凭据。
+> 控制台凭据是**会话级**的，与 API Key 相互独立。转发流量始终用 API Key，
+> 只有查额度才用这套凭据。
+>
+> **⚠️ 实测有效期只有约 2 小时。** Oasis-Token 的 JWT 载荷里
+> `exp - create_at` 恒为 **7200 秒**。Cookie 自带的过期时间（写着 2027 年）
+> **完全不可信**——按它来安排刷新一定会踩空。界面会显示「凭据剩 X 小时」，
+> 过期后额度停止刷新并给出明确提示，不会静默显示陈旧数字。
+>
+> 因此它适合「现在看一眼还剩多少额度」，**不适合当长期监控**。
+> 想要持续监控需要每 2 小时重新获取一次凭据。
+>
 > 5h / 周窗口为 `null` 表示该套餐不按这两种窗口限流（上游两者都返回 0），
 > 而不是"剩余 0%"。
 

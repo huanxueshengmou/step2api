@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     console_webid_enc    TEXT,
     console_synced_at    TEXT,
     console_error        TEXT,
+    console_expires_at   TEXT,
 
     -- 控制台额度缓存
     five_hour_left_rate  REAL,
@@ -238,6 +239,7 @@ class Store:
             "console_webid_enc": "TEXT",
             "console_synced_at": "TEXT",
             "console_error": "TEXT",
+            "console_expires_at": "TEXT",
             "five_hour_left_rate": "REAL",
             "five_hour_reset_at": "TEXT",
             "weekly_left_rate": "REAL",
@@ -505,6 +507,7 @@ class Store:
                 quota_checked_at = ?,
                 console_synced_at = ?,
                 console_error = CASE WHEN ? THEN NULL ELSE ? END,
+                console_expires_at = COALESCE(?, console_expires_at),
                 five_hour_left_rate = COALESCE(?, five_hour_left_rate),
                 five_hour_reset_at = COALESCE(?, five_hour_reset_at),
                 weekly_left_rate = COALESCE(?, weekly_left_rate),
@@ -527,6 +530,7 @@ class Store:
                 snapshot.get("probed_at") or _now(),
                 1 if snapshot.get("ok") else 0,
                 snapshot.get("error"),
+                snapshot.get("credential_expires_at"),
                 snapshot.get("five_hour_left_rate"),
                 snapshot.get("five_hour_reset_at"),
                 snapshot.get("weekly_left_rate"),
