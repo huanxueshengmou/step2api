@@ -270,7 +270,6 @@ class Gateway:
         if requested_proxy:
             ctx.requested_proxy = requested_proxy
 
-        url = build_upstream_url(self.settings, path)
         started = time.perf_counter()
         last_error: str | None = None
         attempts = 0
@@ -281,6 +280,10 @@ class Gateway:
 
             proxy_url = requested_proxy or target.proxy.url
             client = self._client(proxy_url)
+            # 每个账号可以指向不同的上游基址（分级体系按账号生效）
+            url = build_upstream_url(
+                self.settings, path, plan_base=target.plan_base, api_base=target.balance_base
+            )
             upstream_headers = _filter_request_headers(headers)
             upstream_headers["Authorization"] = f"Bearer {target.api_key}"
             upstream_headers.setdefault("Accept", "application/json")

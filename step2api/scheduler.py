@@ -10,8 +10,9 @@ import logging
 from datetime import datetime, timezone
 
 from .config import Settings
+from .console import ConsoleClient
 from .proxy import check_many
-from .quota import fetch_quota
+from .quota import endpoint_for_base, fetch_quota
 from .router import Router
 from .store import Store
 
@@ -85,7 +86,12 @@ class Scheduler:
 
     # ------------------------------------------------------------------
     async def refresh_account(self, account_id: int) -> dict:
-        """刷新单个账号的额度，返回可序列化结果。"""
+        """刷新单个账号的额度，返回可序列化结果。
+
+        优先走控制台（Oasis）接口 —— 只有它能给出**真实的订阅额度**：套餐档位、
+        Credit 余量、5 小时与周窗口限额。没配控制台凭据、或凭据失效时，退回
+        API Key 通道（按量余额 + 额度端点探测）。
+        """
         row = self.store.get_account(account_id)
         if row is None:
             return {"id": account_id, "ok": False, "error": "账号不存在"}
@@ -94,6 +100,11 @@ class Scheduler:
         api_key = self.store.decrypt_key(row)
         if not api_key:
             return {"id": account_id, "ok": False, "error": "缺少 API Key"}
+
+        if self.settings.console_sync:
+            console_result = await self._refresh_via_console(account_id, account)
+            if console_result is not None:
+                return console_result
 
         try:
             proxy = self.router.resolve_proxy(account)
@@ -105,16 +116,66 @@ class Scheduler:
             settings=self.settings,
             proxy=proxy.url if proxy else None,
             known_plan_endpoint=account.get("plan_endpoint"),
+            plan_base=account.get("plan_base") or None,
+            balance_base=account.get("balance_base") or None,
         )
         snapshot = result.snapshot.as_dict()
         snapshot["plan_endpoint"] = result.plan_endpoint
         self.store.update_account_quota(account_id, snapshot)
+
+        # 没命中额度端点时，若库里缓存的端点不属于当前基址就清掉 —— 否则它会被
+        # 后续探测当作完整 URL 直接复用，把请求打到旧上游上。
+        if result.plan_endpoint is None:
+            base = (account.get("plan_base") or self.settings.plan_base).rstrip("/")
+            if account.get("plan_endpoint") and not endpoint_for_base(
+                account["plan_endpoint"], base
+            ):
+                self.store.update_account(account_id, plan_endpoint=None)
+
+            # 本轮探测完整跑过所有候选都没命中，且回落到了余额通道 —— 说明该上游
+            # 确实没有额度查询接口。此时清掉历史额度数据，避免界面长期显示一个
+            # 早已失效的套餐与剩余额度。
+            if snapshot.get("source") == "balance":
+                self.store.clear_account_plan_quota(account_id)
 
         # 额度恢复了，顺带解除冷却
         if snapshot.get("ok") and account.get("status") == "cooldown":
             if snapshot.get("credits_remaining") is None or snapshot["credits_remaining"] > 0:
                 self.store.clear_cooldown(account_id)
 
+        return {"id": account_id, **snapshot}
+
+    async def _refresh_via_console(self, account_id: int, account: dict) -> dict | None:
+        """尝试用控制台凭据刷新。
+
+        返回 ``None`` 表示"未配置凭据，请走 API Key 路径"；凭据存在但失效时
+        返回失败结果并在库里记下原因（不静默回落，否则用户会以为额度是 API
+        查出来的，实际只是查不到）。
+        """
+        token, webid = self.store.get_console_credentials(account_id)
+        if not token or not webid:
+            return None
+
+        try:
+            proxy = self.router.resolve_proxy(account)
+            proxy_url = proxy.url
+        except Exception:  # noqa: BLE001 - 代理异常时退化为直连
+            proxy_url = None
+
+        client = ConsoleClient(
+            token,
+            webid,
+            settings=self.settings,
+            app_id=self.settings.console_app_id,
+            base=self.settings.console_base,
+            proxy=proxy_url,
+        )
+        quota = await client.fetch()
+        snapshot = quota.as_snapshot()
+        self.store.update_account_console_quota(account_id, snapshot)
+
+        if quota.ok and (quota.remaining_credits is None or quota.remaining_credits > 0):
+            self.store.clear_cooldown(account_id)
         return {"id": account_id, **snapshot}
 
     async def refresh_all(self, *, account_ids: list[int] | None = None) -> list[dict]:

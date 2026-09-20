@@ -23,7 +23,7 @@ from typing import Any, Iterator, Sequence
 from .config import Settings
 from .crypto import get_box, key_fingerprint, key_hint
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -65,6 +65,19 @@ CREATE TABLE IF NOT EXISTS accounts (
     voucher_balance      REAL,
     account_type         TEXT,
     balance_checked_at   TEXT,
+
+    -- 控制台会话凭据（Oasis）。API Key 查不到订阅额度，只有控制台接口有。
+    console_token_enc    TEXT,
+    console_webid_enc    TEXT,
+    console_synced_at    TEXT,
+    console_error        TEXT,
+
+    -- 控制台额度缓存
+    five_hour_left_rate  REAL,
+    five_hour_reset_at   TEXT,
+    weekly_left_rate     REAL,
+    weekly_reset_at      TEXT,
+    auto_renew           INTEGER NOT NULL DEFAULT 0,
 
     -- 路由与代理
     max_concurrency      INTEGER NOT NULL DEFAULT 0,
@@ -203,10 +216,37 @@ class Store:
     def init(self) -> None:
         with self.tx() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO kv(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """给既有库补上新增列。
+
+        ``CREATE TABLE IF NOT EXISTS`` 不会改动已存在的表，所以升级时必须显式
+        补列，否则老库上会报 no such column。
+        """
+        existing = {
+            row["name"] for row in conn.execute("PRAGMA table_info(accounts)").fetchall()
+        }
+        additions = {
+            # v2：控制台会话凭据与额度缓存
+            "console_token_enc": "TEXT",
+            "console_webid_enc": "TEXT",
+            "console_synced_at": "TEXT",
+            "console_error": "TEXT",
+            "five_hour_left_rate": "REAL",
+            "five_hour_reset_at": "TEXT",
+            "weekly_left_rate": "REAL",
+            "weekly_reset_at": "TEXT",
+            "auto_renew": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, ddl in additions.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE accounts ADD COLUMN {column} {ddl}")
 
     def close(self) -> None:
         with self._lock:
@@ -410,6 +450,115 @@ class Store:
                 _now(),
                 account_id,
             ),
+        )
+
+    # -- 控制台会话凭据（Oasis）------------------------------------------
+    def set_console_credentials(
+        self, account_id: int, token: str, webid: str
+    ) -> None:
+        """写入控制台会话凭据（密文落库）。"""
+        self.execute(
+            "UPDATE accounts SET console_token_enc = ?, console_webid_enc = ?, "
+            "console_error = NULL, updated_at = ? WHERE id = ?",
+            (
+                self._box.encrypt(token) if token else None,
+                self._box.encrypt(webid) if webid else None,
+                _now(),
+                account_id,
+            ),
+        )
+
+    def get_console_credentials(self, account_id: int) -> tuple[str, str]:
+        """取回控制台凭据明文；未配置则返回两个空串。"""
+        row = self.one(
+            "SELECT console_token_enc, console_webid_enc FROM accounts WHERE id = ?",
+            (account_id,),
+        )
+        if row is None:
+            return "", ""
+        token = self._box.decrypt(row["console_token_enc"] or "")
+        webid = self._box.decrypt(row["console_webid_enc"] or "")
+        return token, webid
+
+    def clear_console_credentials(self, account_id: int) -> None:
+        self.execute(
+            "UPDATE accounts SET console_token_enc = NULL, console_webid_enc = NULL, "
+            "console_error = NULL, updated_at = ? WHERE id = ?",
+            (_now(), account_id),
+        )
+
+    def update_account_console_quota(self, account_id: int, snapshot: dict) -> None:
+        """写入控制台额度结果（同时覆盖订阅额度维度）。"""
+        self.execute(
+            """
+            UPDATE accounts SET
+                plan_name = COALESCE(?, plan_name),
+                plan_status = COALESCE(?, plan_status),
+                credits_remaining = COALESCE(?, credits_remaining),
+                credits_total = COALESCE(?, credits_total),
+                credits_used = COALESCE(?, credits_used),
+                quota_reset_at = COALESCE(?, quota_reset_at),
+                quota_expires_at = COALESCE(?, quota_expires_at),
+                quota_source = 'console',
+                quota_ok = ?,
+                quota_error = ?,
+                quota_checked_at = ?,
+                console_synced_at = ?,
+                console_error = CASE WHEN ? THEN NULL ELSE ? END,
+                five_hour_left_rate = COALESCE(?, five_hour_left_rate),
+                five_hour_reset_at = COALESCE(?, five_hour_reset_at),
+                weekly_left_rate = COALESCE(?, weekly_left_rate),
+                weekly_reset_at = COALESCE(?, weekly_reset_at),
+                auto_renew = COALESCE(?, auto_renew),
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                snapshot.get("plan_name"),
+                snapshot.get("plan_status"),
+                snapshot.get("credits_remaining"),
+                snapshot.get("credits_total"),
+                snapshot.get("credits_used"),
+                snapshot.get("reset_at"),
+                snapshot.get("expires_at"),
+                1 if snapshot.get("ok") else 0,
+                snapshot.get("error"),
+                snapshot.get("probed_at") or _now(),
+                snapshot.get("probed_at") or _now(),
+                1 if snapshot.get("ok") else 0,
+                snapshot.get("error"),
+                snapshot.get("five_hour_left_rate"),
+                snapshot.get("five_hour_reset_at"),
+                snapshot.get("weekly_left_rate"),
+                snapshot.get("weekly_reset_at"),
+                snapshot.get("auto_renew"),
+                _now(),
+                account_id,
+            ),
+        )
+
+    def mark_console_error(self, account_id: int, error: str | None) -> None:
+        self.execute(
+            "UPDATE accounts SET console_error = ?, updated_at = ? WHERE id = ?",
+            (error, _now(), account_id),
+        )
+
+    def clear_account_plan_quota(self, account_id: int) -> None:
+        """清空订阅额度维度。
+
+        用于"额度端点确认不可用"的情形：此时保留旧值会显示一个早已失效的套餐，
+        比显示未知更具误导性。金额维度不动。
+        """
+        self.execute(
+            """
+            UPDATE accounts SET
+                plan_name = NULL, plan_status = NULL,
+                credits_remaining = NULL, credits_total = NULL, credits_used = NULL,
+                quota_reset_at = NULL, quota_expires_at = NULL,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (_now(), account_id),
         )
 
     def mark_account_result(

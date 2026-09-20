@@ -280,7 +280,17 @@ function renderAccounts() {
         <div class="muted small">${esc(a.group_name || "default")}${a.priority !== 100 ? ` · P${a.priority}` : ""}${a.weight !== 1 ? ` · W${a.weight}` : ""}</div>
       </td>
       <td class="mono">${esc(a.key_hint)}</td>
-      <td>${planBadge}${a.plan_status ? `<div class="muted small">${esc(a.plan_status)}</div>` : ""}</td>
+      <td>
+        ${planBadge}
+        ${a.plan_status ? `<div class="muted small">${esc(a.plan_status)}${a.auto_renew ? " · 自动续费" : ""}</div>` : ""}
+        ${a.five_hour_left_rate !== null && a.five_hour_left_rate !== undefined
+          ? `<div class="muted small">5h ${(a.five_hour_left_rate * 100).toFixed(0)}%</div>` : ""}
+        ${a.weekly_left_rate !== null && a.weekly_left_rate !== undefined
+          ? `<div class="muted small">周 ${(a.weekly_left_rate * 100).toFixed(0)}%</div>` : ""}
+        ${a.console_error
+          ? `<div class="muted small truncate" title="${esc(a.console_error)}">控制台：${esc(a.console_error.slice(0, 28))}…</div>`
+          : (a.console_configured ? "" : `<div class="muted small">未配控制台</div>`)}
+      </td>
       <td class="w-quota">
         <div>${quotaText}${a.low_quota ? ' <span class="pill warn">告警</span>' : ""}</div>
         <div class="bar ${quotaBarClass(a.percent_remaining)}"><span style="width:${pct === null ? 0 : Math.max(2, pct).toFixed(1)}%"></span></div>
@@ -403,6 +413,22 @@ function openAccountModal(account = null) {
       </div>
       <label class="inline"><input type="checkbox" id="mRotation" ${a.proxy_rotation !== false ? "checked" : ""}> 池内允许轮转（关闭则同一会话固定用同一出口）</label>
       <label>备注 <input id="mNote" value="${esc(a.note || "")}"></label>
+      <div class="row">
+        <label>控制台 Oasis-Token（可选，用于查真实订阅额度）
+          <input id="mConsoleToken" placeholder="${a.console_configured ? "已配置，留空则不修改" : "Cookie Oasis-Token"}">
+        </label>
+        <label>控制台 web_id（localStorage，非 Cookie）
+          <input id="mConsoleWebid" placeholder="${a.console_configured ? "已配置，留空则不修改" : "localStorage.web_id"}">
+        </label>
+      </div>
+      <div class="row">
+        <label>Step Plan 基址（留空用默认）
+          <input id="mPlanBase" value="${esc(a.plan_base || "")}" placeholder="${esc(state.settings?.plan_base || "")}">
+        </label>
+        <label>按量计费基址（留空用默认）
+          <input id="mBalanceBase" value="${esc(a.balance_base || "")}" placeholder="${esc(state.settings?.upstream_base || "")}">
+        </label>
+      </div>
       ${isEdit ? "" : '<label class="inline"><input type="checkbox" id="mVerify" checked> 保存后立即查询额度</label>'}
     </div>`,
     `<button class="btn" onclick="closeModal()">取消</button>
@@ -429,7 +455,11 @@ function openAccountModal(account = null) {
         proxy_mode: $("#mProxyMode").value,
         proxy_rotation: $("#mRotation").checked,
         note: $("#mNote").value,
+        plan_base: $("#mPlanBase").value.trim(),
+        balance_base: $("#mBalanceBase").value.trim(),
       };
+      const cToken = $("#mConsoleToken").value.trim();
+      const cWebid = $("#mConsoleWebid").value.trim();
       const proxyId = $("#mProxyId").value;
       const poolId = $("#mPoolId").value;
       payload.proxy_id = proxyId ? Number(proxyId) : null;
@@ -441,7 +471,19 @@ function openAccountModal(account = null) {
       if (isEdit) {
         if (key) payload.api_key = key;
         await api(`/accounts/${account.id}`, { method: "PATCH", body: JSON.stringify(payload) });
-        toast("已保存", "ok");
+        if (cToken || cWebid) {
+          const r = await api(`/accounts/${account.id}/console`, {
+            method: "POST",
+            body: JSON.stringify({ token: cToken, webid: cWebid, verify: true }),
+          });
+          const acc = r.account || {};
+          toast(acc.plan_name
+            ? `控制台额度已同步：${acc.plan_name}`
+            : `控制台凭据已保存${acc.console_error ? "（" + acc.console_error.slice(0, 40) + "）" : ""}`,
+            acc.plan_name ? "ok" : "warn");
+        } else {
+          toast("已保存", "ok");
+        }
       } else {
         payload.api_key = key;
         payload.verify = $("#mVerify").checked;

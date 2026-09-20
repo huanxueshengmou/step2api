@@ -144,6 +144,9 @@ class RouteTarget:
     percent_remaining: float | None = None
     credits_remaining: float | None = None
     score: float = 0.0
+    #: 账号级上游基址（空串表示继承全局）
+    plan_base: str = ""
+    balance_base: str = ""
 
     def describe(self) -> str:
         quota = (
@@ -518,6 +521,8 @@ class Router:
                 percent_remaining=percent,
                 credits_remaining=row.get("credits_remaining"),
                 score=self._score(row),
+                plan_base=row.get("plan_base") or "",
+                balance_base=row.get("balance_base") or "",
             )
 
         if session_row:
@@ -593,19 +598,38 @@ def select_channel(path: str, settings: Settings) -> str:
     return "api"
 
 
-def build_upstream_url(settings: Settings, path: str) -> str:
-    """把下游路径映射到上游完整 URL。"""
+def _split_base(base: str) -> tuple[str, str]:
+    """把 ``https://host/a/b`` 拆成 ``("https://host", "/a/b")``。"""
+    scheme, _, rest = base.partition("://")
+    if not rest:
+        return "", ""
+    host, slash, tail = rest.partition("/")
+    return f"{scheme}://{host}", (f"/{tail}" if slash else "")
+
+
+def build_upstream_url(
+    settings: Settings,
+    path: str,
+    plan_base: str | None = None,
+    api_base: str | None = None,
+) -> str:
+    """把下游路径映射到上游完整 URL。
+
+    ``plan_base`` / ``api_base`` 是**账号级**基址（可为空，空则用全局默认）。
+    每个账号可以指向不同的上游 —— 这是"分级体系"能按账号生效的前提。
+    """
     normalized = path if path.startswith("/") else "/" + path
     channel = select_channel(normalized, settings)
+    origin, prefix = _split_base(settings.plan_base)
 
     if channel == "plan":
-        base = settings.plan_base
-        plan_path = "/" + settings.plan_base.split("://", 1)[-1].split("/", 1)[1]
-        remainder = normalized[len(plan_path):] or "/"
-        return f"{base}{remainder}"
+        base = (plan_base or settings.plan_base).rstrip("/")
+        remainder = normalized[len(prefix):] if prefix and normalized.startswith(prefix) else normalized
+        return f"{base}{remainder or '/'}"
 
     # 按量通道：下游 /v1/messages → 上游 https://api.stepfun.ai/v1/messages
-    return f"{settings.upstream_base}{normalized}"
+    base = (api_base or settings.upstream_base).rstrip("/")
+    return f"{base}{normalized}"
 
 
 @dataclass

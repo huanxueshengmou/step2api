@@ -796,3 +796,163 @@ def test_concurrency_gate_semaphore_reused_per_account():
     assert a is b, "同一账号同一上限必须复用同一个信号量"
     assert gate.semaphore(7, 3) is not a, "上限变化后应重建信号量"
     assert isinstance(a, asyncio.Semaphore)
+
+# --------------------------------------------------------------------------
+# 控制台（Oasis）额度解析
+# --------------------------------------------------------------------------
+
+
+def test_console_window_treats_zero_as_not_applicable():
+    """上游用 0 表示"该窗口不适用"，不能误显示成"剩余 0%"。"""
+    from step2api.console import _window
+
+    assert _window(0, "0") == (None, None)
+    assert _window("0", None) == (None, None)
+    assert _window(None, None) == (None, None)
+
+    rate, reset = _window(1, "1791190544")
+    assert rate == 1.0
+    assert reset is not None and reset.year == 2026
+
+    # 剩余 0 但有重置时间 —— 这是真的耗尽了
+    rate, reset = _window(0, "1791190544")
+    assert rate == 0.0
+    assert reset is not None
+
+
+def test_console_quota_derives_credits_from_buckets():
+    from step2api.console import ConsoleQuota, CreditBucket
+
+    q = ConsoleQuota(
+        ok=True,
+        buckets=[
+            CreditBucket(type="subscription", total=1_600_000_000, residual=1_200_000_000),
+            CreditBucket(type="topup", total=400_000_000, residual=100_000_000),
+        ],
+    )
+    assert q.total_credits == 2_000_000_000
+    assert q.remaining_credits == 1_300_000_000
+    assert q.used_credits == 700_000_000
+    assert q.percent_remaining == pytest.approx(0.65)
+
+
+def test_console_quota_percent_none_without_buckets():
+    from step2api.console import ConsoleQuota
+
+    q = ConsoleQuota(ok=True)
+    assert q.total_credits is None
+    assert q.percent_remaining is None
+    assert q.remaining_credits is None
+
+
+def test_console_snapshot_maps_to_store_fields():
+    from step2api.console import ConsoleQuota, CreditBucket, PlanStatus
+
+    from datetime import datetime, timedelta, timezone
+
+    expiry = datetime.now(timezone.utc) + timedelta(days=10)
+    q = ConsoleQuota(
+        ok=True,
+        status=PlanStatus(plan_name="Plus", status="active", expired_at=expiry),
+        five_hour_left=0.5,
+        weekly_left=0.25,
+        buckets=[CreditBucket(type="subscription", total=1000.0, residual=250.0,
+                              expire_at=expiry)],
+    )
+    snap = q.as_snapshot()
+    assert snap["ok"] is True
+    assert snap["source"] == "console"
+    assert snap["plan_name"] == "Plus"
+    assert snap["credits_total"] == 1000.0
+    assert snap["credits_remaining"] == 250.0
+    assert snap["credits_used"] == 750.0
+    assert snap["five_hour_left_rate"] == 0.5
+    assert snap["weekly_left_rate"] == 0.25
+    assert q.seconds_remaining is not None and q.seconds_remaining > 0
+
+
+def test_console_auth_error_is_reported_not_swallowed(store):
+    """凭据失效要显式报错，不能静默当成"查不到额度"。"""
+    from step2api.console import ConsoleAuthError
+
+    err = ConsoleAuthError("控制台凭据被拒绝：Oasis-appID 必须为 20700")
+    assert "20700" in str(err)
+
+
+def test_store_console_credentials_roundtrip(store):
+    aid = store.create_account(name="a", api_key="sk-console-key-0001")
+    store.set_console_credentials(aid, "tok-abc", "web-xyz")
+
+    token, webid = store.get_console_credentials(aid)
+    assert (token, webid) == ("tok-abc", "web-xyz")
+
+    # 密文落库
+    row = store.get_account(aid)
+    assert "tok-abc" not in (row["console_token_enc"] or "")
+    assert "web-xyz" not in (row["console_webid_enc"] or "")
+
+    store.clear_console_credentials(aid)
+    assert store.get_console_credentials(aid) == ("", "")
+
+
+def test_store_console_quota_update_marks_source(store):
+    aid = store.create_account(name="a", api_key="sk-console-key-0002")
+    store.update_account_console_quota(aid, {
+        "ok": True, "source": "console", "plan_name": "Plus", "plan_status": "active",
+        "credits_remaining": 1_600_000_000.0, "credits_total": 1_600_000_000.0,
+        "credits_used": 0.0, "five_hour_left_rate": 0.5, "weekly_left_rate": 0.25,
+        "auto_renew": 0,
+    })
+    row = store.get_account(aid)
+    assert row["plan_name"] == "Plus"
+    assert row["quota_source"] == "console"
+    assert row["credits_remaining"] == 1_600_000_000.0
+    assert row["five_hour_left_rate"] == 0.5
+    assert row["weekly_left_rate"] == 0.25
+    assert row["console_synced_at"] is not None
+
+
+def test_store_migration_adds_console_columns(tmp_path):
+    """老库升级：已有 accounts 表要能补上新列。"""
+    import sqlite3
+
+    from step2api.config import Settings
+    from step2api.store import Store
+
+    settings = Settings(data_dir=tmp_path)
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+
+    # 用真实 v1 结构造库：取当前 SCHEMA，剔掉 v2 才引入的控制台列
+    from step2api.store import SCHEMA
+
+    v1 = SCHEMA
+    for line in (
+        "    console_token_enc    TEXT,",
+        "    console_webid_enc    TEXT,",
+        "    console_synced_at    TEXT,",
+        "    console_error        TEXT,",
+        "    five_hour_left_rate  REAL,",
+        "    five_hour_reset_at   TEXT,",
+        "    weekly_left_rate     REAL,",
+        "    weekly_reset_at      TEXT,",
+        "    auto_renew           INTEGER NOT NULL DEFAULT 0,",
+    ):
+        assert line in v1, f"SCHEMA 结构变了，迁移测试需要同步：{line}"
+        v1 = v1.replace(line + "\n", "")
+
+    db = settings.db_path
+    conn = sqlite3.connect(str(db))
+    conn.executescript(v1)
+    conn.execute(
+        "INSERT INTO accounts(name, api_key_enc, key_fp, created_at, updated_at) "
+        "VALUES('old','enc','fp','t','t')"
+    )
+    conn.commit()
+    conn.close()
+
+    st = Store(settings)
+    st.init()  # 不应抛 no such column
+    row = st.get_account(1)
+    assert row["console_token_enc"] is None
+    assert row["weekly_left_rate"] is None
+    st.close()

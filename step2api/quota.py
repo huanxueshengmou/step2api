@@ -347,6 +347,20 @@ def _auth_headers(api_key: str) -> dict[str, str]:
     }
 
 
+def endpoint_for_base(endpoint: str | None, base: str) -> str | None:
+    """仅当缓存端点属于当前基址时才返回它，否则丢弃。
+
+    缓存的是完整 URL，直接复用会绕过 ``base`` 参数的变化，导致账号改了
+    plan_base 之后仍然去请求旧上游。
+    """
+    if not endpoint or not base:
+        return None
+    if not endpoint.startswith("http"):
+        # 存的是相对路径，跟着当前基址走是安全的
+        return f"{base}{endpoint}"
+    return endpoint if endpoint.startswith(base.rstrip("/") + "/") else None
+
+
 def _build_client(proxy: str | None, settings: Settings, timeout: float) -> httpx.AsyncClient:
     kwargs: dict[str, Any] = {
         "timeout": httpx.Timeout(timeout, connect=min(timeout, settings.connect_timeout)),
@@ -373,27 +387,37 @@ async def fetch_quota(
     proxy: str | None = None,
     plan_endpoint: str | None = None,
     known_plan_endpoint: str | None = None,
+    plan_base: str | None = None,
+    balance_base: str | None = None,
 ) -> QuotaResult:
     """查询一个账号的额度。
 
     :param plan_endpoint: 指定要探测的 plan 端点（单路径模式）
     :param known_plan_endpoint: 该账号上次探测命中的端点，会优先重试
+    :param plan_base: 账号级 Step Plan 基址（空则用全局默认）
+    :param balance_base: 账号级按量计费基址（空则用全局默认）
     """
     if not api_key:
         return QuotaResult(QuotaSnapshot(ok=False, error="缺少 API Key"))
 
+    plan_base = (plan_base or settings.plan_base).rstrip("/")
+
+    # 缓存的命中端点可能来自另一个基址（账号改过 plan_base，或换过上游）。
+    # 它是完整 URL，会被直接当作请求目标而绕过当前基址 —— 那样探测会打到
+    # 旧上游上并返回陈旧结果。只在同源时才复用。
+    cached_endpoint = endpoint_for_base(known_plan_endpoint, plan_base)
+
     candidates: list[str] = []
     if plan_endpoint:
         candidates.append(plan_endpoint)
-    if known_plan_endpoint and known_plan_endpoint not in candidates:
-        candidates.append(known_plan_endpoint)
+    if cached_endpoint and cached_endpoint not in candidates:
+        candidates.append(cached_endpoint)
     if not plan_endpoint:
         for path in settings.plan_quota_paths:
             if path not in candidates:
                 candidates.append(path)
 
     last_error: str | None = None
-    plan_base = settings.plan_base
 
     async with _build_client(proxy, settings, settings.probe_timeout) as client:
         # ---- 1. Step Plan 订阅通道（额度维度）----
@@ -407,7 +431,9 @@ async def fetch_quota(
         # ---- 2. 按量计费通道（金额维度）----
         # 关键：即使订阅额度查到了，余额也要独立查一次 —— 两条通道是分级体系，
         # 用户需要同时看到"套餐还剩多少 Credit"和"账户还压着多少钱"。
-        balance_snapshot, balance_error = await _fetch_balance(client, api_key, settings)
+        balance_snapshot, balance_error = await _fetch_balance(
+            client, api_key, settings, balance_base
+        )
 
         if plan_snapshot is not None:
             # 把金额维度合并进同一个快照返回
@@ -489,9 +515,11 @@ async def _fetch_balance(
     client: httpx.AsyncClient,
     api_key: str,
     settings: Settings,
+    balance_base: str | None = None,
 ) -> tuple[QuotaSnapshot | None, str | None]:
     """查询按量计费通道余额。返回 ``(快照或 None, 错误)``。"""
-    url = f"{settings.upstream_base}{settings.balance_path}"
+    base = (balance_base or settings.upstream_base).rstrip("/")
+    url = f"{base}{settings.balance_path}"
     try:
         resp = await client.get(url, headers=_auth_headers(api_key))
     except httpx.HTTPError as exc:
@@ -531,6 +559,7 @@ async def probe_plan_endpoint(
     *,
     settings: Settings,
     proxy: str | None = None,
+    plan_base: str | None = None,
 ) -> tuple[str | None, list[str]]:
     """逐个探测候选额度端点，供 ``step2api probe-endpoint`` 命令使用。
 
@@ -541,7 +570,8 @@ async def probe_plan_endpoint(
 
     async with _build_client(proxy, settings, settings.probe_timeout) as client:
         for path in settings.plan_quota_paths:
-            url = path if path.startswith("http") else f"{settings.plan_base}{path}"
+            base = (plan_base or settings.plan_base).rstrip("/")
+            url = path if path.startswith("http") else f"{base}{path}"
             try:
                 resp = await client.get(url, headers=_auth_headers(api_key))
             except httpx.HTTPError as exc:

@@ -156,6 +156,15 @@ def serialize_account(row: Any, settings: Settings) -> dict:
         "account_type": data.get("account_type"),
         "balance_checked_at": _iso(data.get("balance_checked_at")),
         "currency": settings.currency,
+        # 控制台额度维度（Step Plan 真实额度）
+        "console_configured": bool(data.get("console_token_enc")),
+        "console_synced_at": _iso(data.get("console_synced_at")),
+        "console_error": data.get("console_error"),
+        "five_hour_left_rate": data.get("five_hour_left_rate"),
+        "five_hour_reset_at": _iso(data.get("five_hour_reset_at")),
+        "weekly_left_rate": data.get("weekly_left_rate"),
+        "weekly_reset_at": _iso(data.get("weekly_reset_at")),
+        "auto_renew": bool(data.get("auto_renew")),
         # 运行状态
         "status": data.get("status"),
         "last_error": data.get("last_error"),
@@ -262,6 +271,9 @@ class ImportRequest(BaseModel):
     plan_base: str = ""
     balance_base: str = ""
     enabled: bool = True
+    #: 批量为所有导入账号配置同一套控制台凭据（通常同一个浏览器会话）
+    console_token: str = ""
+    console_webid: str = ""
 
 
 class ProxyCreate(BaseModel):
@@ -303,6 +315,20 @@ class PoolUpdate(BaseModel):
     note: str | None = None
     enabled: bool | None = None
     proxy_ids: list[int] | None = None
+
+
+class ConsoleCredentials(BaseModel):
+    """控制台（Oasis）会话凭据。
+
+    Step Plan 的真实额度只有控制台接口能查到，需要浏览器里那套会话值：
+
+    * ``token``   —— Cookie ``Oasis-Token``
+    * ``webid``   —— localStorage 的 ``web_id``（注意：不是 Cookie）
+    """
+
+    token: str = Field(default="", description="Cookie Oasis-Token")
+    webid: str = Field(default="", description="localStorage.web_id")
+    verify: bool = True
 
 
 class RoutingUpdate(BaseModel):
@@ -645,11 +671,52 @@ async def probe_endpoint(request: Request, account_id: int) -> dict:
         proxy_url = None
 
     hit, lines = await probe_plan_endpoint(
-        store.decrypt_key(row), settings=settings, proxy=proxy_url
+        store.decrypt_key(row),
+        settings=settings,
+        proxy=proxy_url,
+        plan_base=account.get("plan_base") or None,
     )
     if hit:
         store.update_account(account_id, plan_endpoint=hit)
     return {"hit": hit, "detail": lines}
+
+
+@router.post("/accounts/{account_id}/console", dependencies=guard)
+async def set_console_credentials(
+    request: Request, account_id: int, payload: ConsoleCredentials
+) -> dict:
+    """保存控制台会话凭据，并可选立即校验。"""
+    store = _store(request)
+    settings = _settings(request)
+    row = store.get_account(account_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="账号不存在")
+
+    token = payload.token.strip()
+    webid = payload.webid.strip()
+    if not token and not webid:
+        raise HTTPException(status_code=400, detail="token 与 webid 不能同时为空")
+
+    store.set_console_credentials(account_id, token, webid)
+
+    result: dict | None = None
+    if payload.verify:
+        result = await request.app.state.scheduler.refresh_account(account_id)
+    return {
+        "ok": bool(result.get("ok")) if result else None,
+        "result": result,
+        "account": serialize_account(store.get_account(account_id), settings),
+    }
+
+
+@router.delete("/accounts/{account_id}/console", dependencies=guard)
+async def clear_console_credentials(request: Request, account_id: int) -> dict:
+    store = _store(request)
+    settings = _settings(request)
+    if store.get_account(account_id) is None:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    store.clear_console_credentials(account_id)
+    return {"account": serialize_account(store.get_account(account_id), settings)}
 
 
 @router.post("/accounts/{account_id}/reset", dependencies=guard)
@@ -805,6 +872,11 @@ async def import_accounts(request: Request, payload: ImportRequest) -> dict:
                 {"id": None, "name": name, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
             )
             continue
+
+        if payload.console_token and payload.console_webid:
+            store.set_console_credentials(
+                account_id, payload.console_token, payload.console_webid
+            )
 
         item: dict = {"id": account_id, "name": name, "ok": True, "verified": None}
         if payload.verify:

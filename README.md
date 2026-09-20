@@ -24,7 +24,8 @@ step2api 把这些问题收在一个进程里解决：一个 SQLite 库管账号
 | 能力 | 说明 |
 | --- | --- |
 | **多账号聚合** | 一个 Base URL 对接 N 个 Key，下游客户端不需要知道账号存在 |
-| **Plan 额度监控** | 展示套餐档位、剩余 Credit、已用 Credit、剩余百分比、重置时间 |
+| **Plan 额度监控** | 真实套餐档位、Credit 余量、剩余百分比、到期时间（经控制台接口获取） |
+| **窗口限额** | 5 小时滚动窗口与周窗口的剩余比例展示（套餐适用时） |
 | **Plan 时长** | 计算并展示距离额度重置 / 订阅到期的剩余时间，即将过期高亮告警 |
 | **金额余额** | 按量计费通道余额（`balance` / 现金 / 赠送），与订阅额度分开展示 |
 | **分级体系** | Step Plan 订阅通道与按量计费通道互不干扰，路径自动映射到各自上游 |
@@ -144,29 +145,85 @@ resp = client.chat.completions.create(
 
 两条通道是**分级体系**：Step Plan 通道消耗订阅 Credit，按量通道消耗账户余额，二者互不影响。同一个账号可能同时有订阅额度和余额，界面会把两个维度分列展示。
 
-### 关于 Step Plan 额度查询端点
+### 关于额度查询：两条路
 
-StepFun 官方公开了按量通道的余额接口：
+**API Key 通道查不到套餐额度。** 这是实测结论：
 
 ```
-GET https://api.stepfun.ai/v1/accounts
+GET https://api.stepfun.ai/v1/accounts              → 200  {"balance": 0.00, ...}  按量余额
+GET https://api.stepfun.ai/step_plan/v1/usage       → 404
+GET https://api.stepfun.ai/step_plan/v1/credits     → 404
+GET https://api.stepfun.ai/step_plan/v1/subscription → 404
 ```
 
-但**没有公开 Step Plan 订阅额度的查询端点**。step2api 对此的处理是：
+`/v1/accounts` 只给按量计费的账户余额，不含套餐 Credit 余量与到期时间。所以 step2api 提供两条额度路径，**优先走控制台那条**。
+
+#### 路径一：控制台会话（推荐，能拿到真实套餐额度）
+
+Step Plan 的套餐档位、Credit 余量、5 小时窗口与周窗口限额，由控制台后端提供：
+
+```
+POST https://account.stepfun.ai/api/step.openapi.devcenter.Dashboard/GetStepPlanStatus
+POST https://account.stepfun.ai/api/step.openapi.devcenter.Dashboard/QueryStepPlanRateLimit
+POST https://account.stepfun.ai/api/step.openapi.devcenter.Dashboard/QueryStepPlanUsages
+```
+
+接口是 gRPC-Web 风格，但**接受 JSON 请求体**，无需 protobuf 编码。需要三个请求头：
+
+| 头 | 从哪里取 |
+| --- | --- |
+| `Oasis-Token` | 浏览器 Cookie 里的 `Oasis-Token` |
+| `Oasis-Webid` | 浏览器 **localStorage 的 `web_id`**（注意不是 Cookie） |
+| `Oasis-appID` | 固定 `20700`（Step Plan 应用；`10300` 是基础平台，用它会返回 `auth failed: oasis-token is embezzled`） |
+
+取值步骤：
+
+1. 登录 <https://account.stepfun.ai/>
+2. F12 → Application → Cookies → 复制 `Oasis-Token` 的值
+3. F12 → Console → 执行 `localStorage.getItem("web_id")`，复制结果
+4. 控制台「账号 → 编辑」填入这两个值，保存即自动校验并同步
+
+也可以随导入一起提供，或走 API：
+
+```bash
+curl -X POST http://127.0.0.1:8787/api/accounts/1/console   -H 'Content-Type: application/json'   -d '{"token":"<Oasis-Token>","webid":"<web_id>","verify":true}'
+```
+
+返回的额度长这样：
+
+```json
+{
+  "plan_name": "Plus",
+  "plan_status": "active",
+  "credits_remaining": 1600000000,
+  "credits_total": 1600000000,
+  "percent_remaining": 1.0,
+  "quota_expires_at": "2026-10-05T08:55:44+00:00",
+  "five_hour_left_rate": null,
+  "weekly_left_rate": null,
+  "auto_renew": false
+}
+```
+
+> 控制台凭据是**会话级**的，退出登录或改密会失效，与 API Key 相互独立。
+> 转发流量始终用 API Key，只有查额度才用这套凭据。
+> 5h / 周窗口为 `null` 表示该套餐不按这两种窗口限流（上游两者都返回 0），
+> 而不是"剩余 0%"。
+
+#### 路径二：API Key 通道（无控制台凭据时的兜底）
 
 1. 按候选路径列表顺序探测 `/usage`、`/credits`、`/quota`、`/subscription`、`/plan` 等端点；
-2. 第一个返回 2xx 且能被解析出额度语义的路径会被记住，后续刷新直接复用它；
-3. 全部候选都没命中时，回落到按量通道的余额接口，至少保证账号可用性可见。
+2. 第一个返回 2xx 且能解析出额度语义的路径会被记住，后续刷新复用；
+3. 全部失败则回落到按量通道余额，至少保证账号可用性可见。
 
-探测结果可以在控制台点账号行的「探测」按钮查看明细。如果确认了真实端点，用环境变量固定下来，避免每次重新探测：
+点账号行的「探测」可查看每个候选的实际返回。若确认了自定义端点：
 
 ```bash
 export STEP2API_PLAN_QUOTA_PATHS=/usage,/credits
-# 或者直接换掉整个基址
 export STEP2API_PLAN_BASE=https://api.stepfun.ai/step_plan/v1
 ```
 
-额度解析器对字段名做了宽松匹配（`remaining_credits` / `credits_remaining` / `remaining` / `left` / `available` / `balance` 等），`total` 与 `used` 缺一个时能相互推导，时间戳支持秒、毫秒与 ISO 字符串。如果上游返回的结构比较特殊，改 `step2api/quota.py` 里的 `_CREDIT_KEYS` / `_TOTAL_KEYS` / `_RESET_KEYS` 即可。
+额度解析器对字段名做宽松匹配（`remaining_credits` / `credits_remaining` / `remaining` / `left` / `available` / `balance` 等），`total` 与 `used` 缺一个时可相互推导，时间戳支持秒、毫秒与 ISO 字符串。结构特殊时改 `step2api/quota.py` 里的 `_CREDIT_KEYS` / `_TOTAL_KEYS` / `_RESET_KEYS` 即可。
 
 ---
 
@@ -324,6 +381,9 @@ X-Step2api-Attempt: 1
 | `STEP2API_REQUEST_TIMEOUT` | `300` 秒 |
 | `STEP2API_CONNECT_TIMEOUT` | `15` 秒 |
 | `STEP2API_PROBE_TIMEOUT` | `20` 秒 |
+| `STEP2API_CONSOLE_BASE` | `https://account.stepfun.ai` | 控制台额度接口基址 |
+| `STEP2API_CONSOLE_APP_ID` | `20700` | 控制台应用 ID，Step Plan 必须为 20700 |
+| `STEP2API_CONSOLE_SYNC` | `true` | 是否启用控制台额度同步 |
 
 ### 路由
 
@@ -388,6 +448,8 @@ step2api export --out accounts.json   # 导出账号明细（不含 Key 明文�
 | `DELETE` | `/api/accounts/{id}` | 删除账号 |
 | `POST` | `/api/accounts/{id}/refresh` | 刷新该账号额度 |
 | `POST` | `/api/accounts/{id}/probe-endpoint` | 探测 Step Plan 额度端点 |
+| `POST` | `/api/accounts/{id}/console` | 配置控制台凭据并校验（查真实套餐额度） |
+| `DELETE` | `/api/accounts/{id}/console` | 清除控制台凭据 |
 | `POST` | `/api/accounts/{id}/reset` | 清除冷却与失败计数 |
 | `POST` | `/api/accounts/{id}/toggle` | 启用 / 禁用 |
 | `POST` | `/api/import/preview` | 解析预览（不落库） |
@@ -461,7 +523,15 @@ store.py          记录结果：额度缓存、冷却、粘性绑定、请求�
 
 **Q：额度一直显示"未知"？**
 
-说明 Step Plan 订阅额度端点没有命中。点账号行的「探测」看候选路径各自返回了什么，或者拿 `step2api probe-endpoint` 在终端里跑一遍。如果上游确实没开这个接口，账号会回落到按量通道余额展示 —— 调度不受影响，额度未知的账号仍然参与路由。
+先看是否配了控制台凭据。不配的话只能走 API Key 通道，而**该通道没有套餐额度接口**（`/step_plan/v1/*` 下的候选路径全部 404），只能回落到按量余额。按上文「路径一」配好 `Oasis-Token` 与 `web_id` 就能看到真实的套餐档位、Credit 余量与到期时间。
+
+**Q：控制台凭据报 "oasis-token is embezzled"？**
+
+这是 `Oasis-appID` 用错或 `Oasis-Webid` 取错位置。`appID` 必须是 `20700`（Step Plan 应用），`Webid` 要从 `localStorage.getItem("web_id")` 取，**不是** Cookie 里的 `Oasis-Webid`。
+
+**Q：5 小时窗口 / 周窗口显示为空？**
+
+正常。上游对不适用的窗口返回 `0`，本服务将其识别为"不适用"而非"剩余 0%"。目前 Credit 计量型套餐就属于这种，额度以 Credit 桶表示。
 
 **Q：为什么某个账号不接请求了？**
 

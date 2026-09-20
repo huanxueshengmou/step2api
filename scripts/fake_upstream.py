@@ -52,6 +52,26 @@ ACCOUNTS = {
         # 无效 Key：额度查询 401，调用也 401
         "behavior": "401",
     },
+    # ---- 以下仅用于演示控制台的额度展示 ----
+    "sk-max-000000000005": {
+        # flash_max，剩余 4% → 触发低额度告警
+        "remaining": 1_600_000_000,
+        "total": 40_000_000_000,
+        "plan": "flash_max",
+    },
+    "sk-empty-000000000006": {
+        # 额度耗尽 → 被额度感知调度摘出候选
+        "remaining": 0,
+        "total": 1_600_000_000,
+        "plan": "flash_plus",
+    },
+    "sk-soon-000000000007": {
+        # 剩余额度充足但 2 天后到期 → Plan 时长告警
+        "remaining": 1_500_000_000,
+        "total": 1_600_000_000,
+        "plan": "flash_plus",
+        "reset_in_days": 2,
+    },
 }
 
 SEEN: list[dict] = []
@@ -108,7 +128,9 @@ async def plan_usage(request: Request):
         return JSONResponse({"error": "invalid api key"}, status_code=401)
 
     behavior = _behavior(key)
-    reset_at = datetime.now(timezone.utc) + timedelta(days=12, hours=4)
+    reset_at = datetime.now(timezone.utc) + timedelta(
+        days=behavior.get("reset_in_days", 12), hours=4
+    )
     return {
         "data": {
             "plan": behavior.get("plan", "flash_mini"),

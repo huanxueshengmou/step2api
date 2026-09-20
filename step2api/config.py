@@ -60,6 +60,14 @@ INTL_HOST = "stepfun.ai"
 #: 国际站控制台，导入说明与手工取 key 的地方
 PORTAL_URL = "https://account.stepfun.ai/"
 
+#: 控制台额度接口（Oasis gRPC-Web 网关）所在基址
+CONSOLE_BASE = "https://account.stepfun.ai"
+
+#: 控制台应用 ID。20700 = Step Plan，10300 = 基础平台。
+#: 用 10300 访问 Step Plan 接口会返回
+#: ``auth failed: oasis-token is embezzled``。
+CONSOLE_APP_ID = 20700
+
 #: 按量计费（金额/余额）通道基址
 UPSTREAM_BASE = "https://api.stepfun.ai"
 
@@ -147,6 +155,15 @@ class Settings:
             if p.strip()
         )
     )
+
+    #: 控制台额度接口（Oasis gRPC-Web 网关）基址
+    console_base: str = field(
+        default_factory=lambda: (_env("CONSOLE_BASE", CONSOLE_BASE) or CONSOLE_BASE).rstrip("/")
+    )
+    #: 控制台应用 ID：20700 = Step Plan，10300 = 基础平台（对 Step Plan 接口会认证失败）
+    console_app_id: int = field(default_factory=lambda: _env_int("CONSOLE_APP_ID", CONSOLE_APP_ID))
+    #: 是否启用控制台额度同步（需要为账号配置 Oasis 会话凭据）
+    console_sync: bool = field(default_factory=lambda: _env_bool("CONSOLE_SYNC", True))
 
     #: 上游请求超时（秒）
     request_timeout: float = field(default_factory=lambda: _env_float("REQUEST_TIMEOUT", 300.0))
@@ -241,6 +258,9 @@ class Settings:
             "balance_path": self.balance_path,
             "plan_quota_paths": list(self.plan_quota_paths),
             "portal_url": PORTAL_URL,
+            "console_base": self.console_base,
+            "console_app_id": self.console_app_id,
+            "console_sync": self.console_sync,
             "routing_mode": self.routing_mode,
             "affinity_ttl": self.affinity_ttl,
             "cooldown_seconds": self.cooldown_seconds,
