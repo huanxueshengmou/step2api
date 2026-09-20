@@ -17,13 +17,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import random
 import threading
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 from .config import Settings
 from .proxy import ProxyPool, ResolvedProxy, is_usable, redact_proxy
@@ -41,13 +39,6 @@ _SESSION_HEADERS = (
     "x-request-id",
     "x-trace-id",
 )
-
-_AFFINITY_HEADERS = (
-    "x-step2api-account",
-    "x-account-id",
-    "x-sticky-account",
-)
-
 
 def extract_session_key(headers: dict[str, str], body: Any) -> str | None:
     """尽量从请求里挖出一个稳定的会话标识。
@@ -118,10 +109,6 @@ def extract_model(body: Any) -> str | None:
         if isinstance(model, str):
             return model
     return None
-
-
-def extract_stream(body: Any) -> bool:
-    return bool(isinstance(body, dict) and body.get("stream"))
 
 
 # --------------------------------------------------------------------------

@@ -15,7 +15,7 @@ from __future__ import annotations
 import itertools
 import random
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 import httpx
@@ -211,14 +211,6 @@ class ProxyPool:
         self.registry.clear()
 
 
-def build_proxy_transport(proxy_url: str | None, *, retries: int = 2) -> httpx.AsyncHTTPTransport:
-    """为给定代理构造 httpx transport（None 表示直连）。"""
-    kwargs: dict = {"retries": retries}
-    if proxy_url:
-        kwargs["proxy"] = normalize_proxy(proxy_url)
-    return httpx.AsyncHTTPTransport(**kwargs)
-
-
 async def check_proxy(
     proxy_url: str,
     check_url: str,
@@ -325,13 +317,3 @@ class ResolvedProxy:
             "header_value": self.header_value(),
         }
 
-
-@dataclass
-class ProxyCandidateSet:
-    """账号可用代理候选集，由服务层组装后交给池选择。"""
-
-    pool_id: int | None = None
-    members: list[dict] = field(default_factory=list)
-
-    def __bool__(self) -> bool:
-        return bool(self.members)

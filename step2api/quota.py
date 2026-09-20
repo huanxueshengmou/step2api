@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 import httpx
@@ -563,8 +563,3 @@ async def probe_plan_endpoint(
 
     return hit, lines
 
-
-def estimate_reset_at(now: datetime | None = None, *, days: int = 30) -> datetime:
-    """在没有重置时间信息时，按 30 天周期估算。"""
-    base = now or datetime.now(timezone.utc)
-    return base + timedelta(days=days)

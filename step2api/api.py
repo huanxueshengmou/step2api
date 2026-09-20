@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
@@ -18,12 +17,11 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, field_validator
 
-from .config import CN_HOST_MARKERS, PORTAL_URL, Settings, get_settings
+from .config import CN_HOST_MARKERS, PORTAL_URL, Settings
 from .crypto import key_fingerprint, key_hint
 from .proxy import ProxyError, normalize_proxy, parse_proxy_list, redact_proxy
 from .quota import probe_plan_endpoint
-from .router import NoAccountAvailable
-from .store import Store, get_store
+from .store import Store
 
 log = logging.getLogger("step2api.api")
 
@@ -1220,6 +1218,3 @@ async def gateway_guard(request: Request) -> None:
 
 gateway_dep = [Depends(gateway_guard)]
 
-
-def _noop() -> None:  # pragma: no cover
-    return None

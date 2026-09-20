@@ -12,7 +12,6 @@ import argparse
 import asyncio
 import json
 import sys
-from datetime import datetime, timezone
 
 from . import __version__
 
@@ -65,7 +64,7 @@ def _cmd_probe_endpoint(args: argparse.Namespace) -> int:
         print(line)
     if hit:
         print(f"\n✓ 命中额度端点：{hit}")
-        print(f"  可通过 STEP2API_PLAN_BASE / STEP2API_PLAN_QUOTA_PATHS 固定该端点。")
+        print("  可通过 STEP2API_PLAN_BASE / STEP2API_PLAN_QUOTA_PATHS 固定该端点。")
         return 0
     print("\n✗ 未命中任何候选端点。")
     print("  上游可能未开放订阅额度查询接口，网关会回落到按量通道余额展示。")

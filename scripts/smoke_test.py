@@ -145,7 +145,7 @@ def main() -> int:
     print("\n[5] 粘性路由（同会话固定同账号）")
     first = None
     stable = True
-    for i in range(4):
+    for _ in range(4):
         rr = c.post(
             f"{GW}/step_plan/v1/messages",
             json={"model": "step-3.5-flash", "messages": [{"role": "user", "content": "hi"}]},

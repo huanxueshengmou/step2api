@@ -11,10 +11,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
+from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Callable
 
 import httpx
@@ -62,9 +63,6 @@ GATEWAY_HEADERS = {
     "x-step2api-no-retry",
     "x-step2api-channel",
 }
-
-#: 响应中回给客户端、标明本次实际路由结果
-ROUTE_ECHO_HEADERS = ("x-step2api-account", "x-step2api-proxy", "x-step2api-attempt")
 
 
 @dataclass
@@ -227,7 +225,7 @@ class Gateway:
             except ValueError:
                 body_json = None
 
-        headers = {k: v for k, v in request.headers.items()}
+        headers = dict(request.headers)
         session_key = extract_session_key(headers, body_json)
         model = extract_model(body_json)
         channel = select_channel(path, self.settings)
@@ -268,14 +266,11 @@ class Gateway:
                 },
             )
 
-        strip_prefix = not requested_proxy
-        upstream_path = path
+        # 单次请求指定代理：同一次转发内所有重试都走它，忽略账号自身的代理配置
         if requested_proxy:
-            # 单次请求指定代理：把代理串从 body/header 之外的地方带进来
             ctx.requested_proxy = requested_proxy
-            strip_prefix = True
 
-        url = build_upstream_url(self.settings, upstream_path)
+        url = build_upstream_url(self.settings, path)
         started = time.perf_counter()
         last_error: str | None = None
         attempts = 0
@@ -300,6 +295,9 @@ class Gateway:
 
             self.router.acquire(target.account_id)
             release_needed = True
+            #: 流式响应会把释放动作移交给生成器（它在本函数返回后才消费），
+            #: 置位后下面的 finally 不再提前归还并发额度。
+            handover = False
             try:
                 await sem.acquire()
             except BaseException:
@@ -405,19 +403,25 @@ class Gateway:
                 is_stream = upstream.headers.get("content-type", "").startswith("text/event-stream")
                 tap = UsageTap()
 
-                def _finish(final_status: int, usage: dict, error: str | None) -> None:
+                # 下面的闭包在本轮循环结束后才被执行（流式响应尤其如此），
+                # 因此所有来自循环的变量都必须在这里按值绑定成默认参数，
+                # 否则会读到下一轮迭代的值。
+                def _finish(
+                    final_status: int,
+                    usage: dict,
+                    error: str | None,
+                    *,
+                    _target: RouteTarget = target,
+                    _attempts: int = attempts,
+                ) -> None:
                     duration = (time.perf_counter() - started) * 1000.0
-                    if usage:
-                        total = int(usage.get("total_tokens") or 0)
-                        if total:
-                            self.store.add_credits_used(target.account_id, 0.0)
                     if log_callback:
                         log_callback(
                             GatewayResult(
-                                account_id=target.account_id,
-                                account_name=target.account_name,
-                                proxy_label=target.proxy.display_label(),
-                                attempts=attempts,
+                                account_id=_target.account_id,
+                                account_name=_target.account_name,
+                                proxy_label=_target.proxy.display_label(),
+                                attempts=_attempts,
                                 status_code=final_status,
                                 channel=channel,
                                 duration_ms=duration,
@@ -429,31 +433,41 @@ class Gateway:
                             path,
                         )
 
-                def _release_once() -> None:
+                def _release_once(
+                    *,
+                    _account_id: int = target.account_id,
+                    _sem: asyncio.Semaphore = sem,
+                ) -> None:
                     nonlocal release_needed
                     if release_needed:
                         release_needed = False
-                        self.router.release(target.account_id)
-                        try:
-                            sem.release()
-                        except ValueError:
-                            pass
+                        self.router.release(_account_id)
+                        with suppress(ValueError):
+                            _sem.release()
 
                 if is_stream:
 
-                    async def _iter() -> AsyncIterator[bytes]:
+                    async def _iter(
+                        *,
+                        _upstream: httpx.Response = upstream,
+                        _tap: UsageTap = tap,
+                        _status: int = status,
+                    ) -> AsyncIterator[bytes]:
                         try:
-                            async for chunk in upstream.aiter_bytes():
-                                tap.feed(chunk)
+                            async for chunk in _upstream.aiter_bytes():
+                                _tap.feed(chunk)
                                 yield chunk
                         except httpx.HTTPError as exc:
-                            _finish(status, tap.usage, f"流中断：{type(exc).__name__}: {exc}")
+                            _finish(_status, _tap.usage, f"流中断：{type(exc).__name__}: {exc}")
                             return
                         finally:
-                            await upstream.aclose()
+                            # 客户端断开或流结束 —— 到这里才真正归还并发额度
+                            with suppress(Exception):
+                                await _upstream.aclose()
                             _release_once()
-                        _finish(status, tap.usage, None)
+                        _finish(_status, _tap.usage, None)
 
+                    handover = True  # 释放动作已移交给生成器
                     return StreamingResponse(
                         _iter(),
                         status_code=status,
@@ -464,7 +478,8 @@ class Gateway:
                 try:
                     payload = await upstream.aread()
                 finally:
-                    await upstream.aclose()
+                    with suppress(Exception):
+                        await upstream.aclose()
                     _release_once()
 
                 tap.feed(payload)
@@ -484,13 +499,12 @@ class Gateway:
                 )
 
             finally:
-                if release_needed:
+                # handover 为真说明这是流式响应，额度由生成器的 finally 归还
+                if release_needed and not handover:
                     release_needed = False
                     self.router.release(target.account_id)
-                    try:
+                    with suppress(ValueError):
                         sem.release()
-                    except ValueError:
-                        pass
 
         # 所有候选都失败
         duration = (time.perf_counter() - started) * 1000.0
@@ -507,6 +521,3 @@ class Gateway:
             },
         )
 
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()

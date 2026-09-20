@@ -192,7 +192,7 @@ def test_parse_balance_payload_returns_none_without_balance():
 
 
 def test_snapshot_duration_helpers():
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta, timezone  # noqa: F401
 
     snap = QuotaSnapshot(
         ok=True,
@@ -303,8 +303,8 @@ def test_store_account_duplicate_fingerprint_rejected(store):
 
 
 def test_store_router_sticky_session(store, settings):
-    a1 = store.create_account(name="a1", api_key="sk-key-aaaa-111111")
-    a2 = store.create_account(name="a2", api_key="sk-key-bbbb-222222")
+    first_id = store.create_account(name="a1", api_key="sk-key-aaaa-111111")
+    second_id = store.create_account(name="a2", api_key="sk-key-bbbb-222222")
     router = Router(store, settings)
 
     ctx = RouteContext(session_key="hdr:session-1")
@@ -317,11 +317,11 @@ def test_store_router_sticky_session(store, settings):
     again = router.plan(ctx, attempts=2)
     assert again[0].account_id == first.account_id
     assert again[0].sticky is True
-    assert {a1, a2} >= {first.account_id}
+    assert first.account_id in (first_id, second_id)
 
 
 def test_router_skips_disabled_account(store, settings):
-    a1 = store.create_account(name="a1", api_key="sk-key-aaaa-111111", enabled=False)
+    store.create_account(name="a1", api_key="sk-key-aaaa-111111", enabled=False)
     a2 = store.create_account(name="a2", api_key="sk-key-bbbb-222222")
     router = Router(store, settings)
     plan = router.plan(RouteContext(), attempts=5)
@@ -347,12 +347,14 @@ def test_router_keeps_account_with_unknown_quota(store, settings):
 
 
 def test_router_respects_cooldown(store, settings):
+    from step2api.router import NoAccountAvailable
+
     a1 = store.create_account(name="a1", api_key="sk-key-aaaa-111111")
     store.mark_account_result(
         a1, success=False, error="boom", cooldown_seconds=300, fail_threshold=1
     )
     router = Router(store, settings)
-    with pytest.raises(Exception):
+    with pytest.raises(NoAccountAvailable):
         router.plan(RouteContext(), attempts=2)
 
 
@@ -591,8 +593,6 @@ def test_router_respects_session_proxy_affinity(store, settings):
 
 
 def test_store_session_expiry(store):
-    from datetime import datetime, timedelta, timezone
-
     account_id = store.create_account(name="a", api_key="sk-key-aaaa-111111")
     store.upsert_session("k1", account_id=account_id, ttl_seconds=-1)
     assert store.get_session("k1") is None
@@ -627,7 +627,7 @@ def test_store_usage_log_roundtrip(store):
 
 
 def test_store_prune_logs(store):
-    for i in range(20):
+    for _ in range(20):
         store.log_usage({"account_id": 1, "status_code": 200})
     store.prune_logs(5)
     assert len(store.list_logs(limit=100)) == 5
@@ -760,3 +760,39 @@ def test_filter_request_headers_drops_auth_and_gateway_headers():
     assert "Authorization" not in out
     assert "X-Step2api-Account" not in out
     assert out["Content-Type"] == "application/json"
+
+
+# --------------------------------------------------------------------------
+# 并发闸门
+# --------------------------------------------------------------------------
+
+
+def test_concurrency_gate_tracks_inflight():
+    from step2api.router import _ConcurrencyGate
+
+    gate = _ConcurrencyGate(default_limit=4)
+    assert gate.limit_for(1, 0) == 4      # 账号未单独配置 → 用默认
+    assert gate.limit_for(1, 2) == 2      # 账号单独配置优先
+
+    assert gate.inflight(1) == 0
+    gate.incr(1)
+    gate.incr(1)
+    assert gate.inflight(1) == 2
+    gate.decr(1)
+    assert gate.inflight(1) == 1
+    gate.decr(1)
+    gate.decr(1)                            # 多余的释放不应把计数压成负数
+    assert gate.inflight(1) == 0
+
+
+def test_concurrency_gate_semaphore_reused_per_account():
+    import asyncio
+
+    from step2api.router import _ConcurrencyGate
+
+    gate = _ConcurrencyGate(default_limit=2)
+    a = gate.semaphore(7, 2)
+    b = gate.semaphore(7, 2)
+    assert a is b, "同一账号同一上限必须复用同一个信号量"
+    assert gate.semaphore(7, 3) is not a, "上限变化后应重建信号量"
+    assert isinstance(a, asyncio.Semaphore)

@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import json
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -82,6 +81,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     success_count        INTEGER NOT NULL DEFAULT 0,
     failure_count        INTEGER NOT NULL DEFAULT 0,
     total_requests       INTEGER NOT NULL DEFAULT 0,
+    -- 由后台额度刷新按上游实际用量回填
     total_credits_used   REAL    NOT NULL DEFAULT 0,
     last_used_at         TEXT,
     created_at           TEXT    NOT NULL,
@@ -478,13 +478,6 @@ class Store:
             (_now(), account_id),
         )
 
-    def add_credits_used(self, account_id: int, amount: float) -> None:
-        if amount <= 0:
-            return
-        self.execute(
-            "UPDATE accounts SET total_credits_used = total_credits_used + ? WHERE id = ?",
-            (amount, account_id),
-        )
 
     def release_expired_cooldowns(self) -> int:
         now = _now()
@@ -833,6 +826,3 @@ def row_to_dict(row: sqlite3.Row | None) -> dict | None:
     data = dict(row)
     return data
 
-
-def dumps(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, default=str)
